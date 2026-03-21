@@ -1,0 +1,14 @@
+[project]
+name = "riscv-translator"
+version = "0.1.0"
+description = "LLM-driven SSE2 to RISC-V Vector translation pipeline for the SSW library"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+uv.lock
+
+# C build artifacts
+*.o
+*.so
+*.a
+rvv_example
+rvv_ssw_test
+ssw_test
+example_c
+bench_ssw
+
+# Repair output
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
