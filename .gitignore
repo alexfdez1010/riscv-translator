@@ -8,18 +8,10 @@ dist/
 build/
 uv.lock
 
-# C build artifacts
+# C/C++ build artifacts
 *.o
 *.so
 *.a
-rvv_example
-rvv_ssw_test
-ssw_test
-example_c
-bench_ssw
-
-# Repair output
-output/
 
 # IDE
 .vscode/
@@ -33,3 +25,5 @@ output/
 # OS
 .DS_Store
 Thumbs.db
+
+output

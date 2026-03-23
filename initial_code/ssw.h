@@ -15,13 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(__riscv) || defined(__riscv__)
-#include "sse2rvv.h"
-#elif defined(__ARM_NEON) // (M1)
-#include "sse2neon.h"
-#else // x86 (Intel)
 #include <emmintrin.h>
-#endif
 
 
 #ifdef __cplusplus

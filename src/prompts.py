@@ -1,112 +1,15 @@
-"""Prompt construction and RVV preprocessing for the SSW repair agent."""
+"""Prompt construction for the generic SSE→Highway RISC-V translation pipeline.
 
-import re
-
-from src.config import REFERENCE_FILE
-from src.diff_utils import diff_error_feedback, diff_format_example
-from src.logger import get_logger
-from src.validators import QEMU_RVV, RISCVCC
-
-logger = get_logger(__name__)
-
-
-def load_riscv_reference() -> str:
-    return REFERENCE_FILE.read_text()
-
-
-# ---------------------------------------------------------------------------
-# Mechanical pre-processing: fix patterns that are always wrong on RVV
-# ---------------------------------------------------------------------------
-
-_VEC_HELPERS = """\
-/* --- RVV compatibility helpers (sizeless __m128i) --- */
-#if defined(__riscv) || defined(__riscv__)
-/* Query actual vector register width at runtime (works for any VLEN). */
-static inline int _ssw_vec_bytes(void) {
-    return (int)__riscv_vsetvlmax_e8m1();
-}
-#define _SSW_VEC_BYTES _ssw_vec_bytes()
-/* Number of 8-bit lanes per vector register (= VLEN / 8). */
-#define _SSW_ELEMS_8  ((int)__riscv_vsetvlmax_e8m1())
-static inline __m128i _load_vec(const void *base, int idx) {
-    int vb = _ssw_vec_bytes();
-    return _mm_load_si128((const __m128i *)((const uint8_t *)base + idx * vb));
-}
-static inline void _store_vec(void *base, int idx, __m128i v) {
-    int vb = _ssw_vec_bytes();
-    _mm_store_si128((__m128i *)((uint8_t *)base + idx * vb), v);
-}
-#define _VEC_PTR(p, i)  ((__m128i *)((uint8_t *)(p) + (i) * _ssw_vec_bytes()))
-#else
-#define _SSW_VEC_BYTES ((int)sizeof(__m128i))
-#define _SSW_ELEMS_8   ((int)(sizeof(__m128i)))
-#define _load_vec(base, idx) (*((const __m128i *)(base) + (idx)))
-#define _store_vec(base, idx, v) (*(((__m128i *)(base)) + (idx)) = (v))
-#define _VEC_PTR(p, i) ((p) + (i))
-#endif
+All prompts are library-agnostic: they guide the LLM to translate x86 SSE
+intrinsics to Google Highway SIMD code targeting RISC-V, and to fix compiler
+errors based on feedback — without any hardcoded, library-specific fixes.
 """
 
+from src.config import REFERENCE_FILE, RVV_REFERENCE
+from src.diff_utils import diff_error_feedback, diff_format_example
+from src.logger import get_logger
 
-def preprocess_rvv_compat(code: str) -> str:
-    """Apply mechanical text-level fixes for RVV sizeless-type issues."""
-    if "__m128i" not in code:
-        return code
-
-    original = code
-
-    # 1. Replace sizeof(__m128i) with _SSW_VEC_BYTES BEFORE injecting helpers
-    #    (so the helpers' own sizeof(__m128i) stays untouched).
-    code = code.replace("sizeof(__m128i)", "_SSW_VEC_BYTES")
-
-    # 2. Inject helper macros after kroundup32
-    if "_SSW_VEC_BYTES" not in original:
-        insert_marker = "#define kroundup32"
-        idx = code.find(insert_marker)
-        if idx != -1:
-            eol = code.find("\n", idx)
-            if eol != -1:
-                code = code[: eol + 1] + "\n" + _VEC_HELPERS + code[eol + 1 :]
-
-    # 3. Replace direct array indexing and pointer arithmetic on known
-    #    __m128i* variable names ONLY (to avoid breaking int8_t* etc.)
-    _vec_names = {"pvHStore", "pvHLoad", "pvE", "pvHmax", "vProfile", "vP"}
-
-    # ptr + expr (pointer arithmetic on __m128i*) -> _VEC_PTR(ptr, expr)
-    for name in _vec_names:
-        code = re.sub(
-            rf'\b{re.escape(name)}\s*\+\s*([^,;)]+?)\s*(?=[,;)])',
-            rf'_VEC_PTR({name}, \1)',
-            code,
-        )
-
-    # a[x] = b[y]; -> _store_vec(a, x, _load_vec(b, y)); for known names
-    for lname in _vec_names:
-        for rname in _vec_names:
-            code = re.sub(
-                rf'\b{re.escape(lname)}\[([^\]]+)\]\s*=\s*{re.escape(rname)}\[([^\]]+)\]\s*;',
-                rf'_store_vec({lname}, \1, _load_vec({rname}, \2));',
-                code,
-            )
-
-    # name[segLen - 1] as rvalue -> _load_vec(name, segLen - 1)
-    for name in _vec_names:
-        code = re.sub(
-            rf'\b{re.escape(name)}\[segLen\s*-\s*1\](?!\s*=)',
-            rf'_load_vec({name}, segLen - 1)',
-            code,
-        )
-
-    # Remaining simple rvalue indexing: name[expr] -> _load_vec(name, expr)
-    for name in _vec_names:
-        code = re.sub(
-            rf'\b{re.escape(name)}\[([^\]]+)\](?!\s*=)',
-            rf'_load_vec({name}, \1)',
-            code,
-        )
-
-    if code != original:
-        logger.info("Pre-processing applied RVV compatibility fixes")
-    return code
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -114,79 +17,84 @@ def preprocess_rvv_compat(code: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_system_prompt(target_file_name: str) -> str:
-    return f"""
-You are a senior software engineer acting as a ReAct-style repair agent for a partially broken Intel-to-RISC-V port of the Striped Smith-Waterman library.
-Make the smallest correct change needed.
+def build_system_prompt(target_file: str) -> str:
+    """Build the system prompt for SSE→Highway translation/repair."""
+    return f"""\
+You are an expert systems programmer specialising in SIMD portability.
+Your task is to incrementally translate and repair C/C++ code that uses
+x86 SSE/SSE2 intrinsics so that it compiles and runs correctly on RISC-V
+using the Google Highway SIMD library.
 
-Context:
-- Work from the current candidate kept in memory.
-- Repair the provided file incrementally until the full project compiles and runs successfully under the provided validation flow.
-- Keep the project structure and behavior intact.
-- The code uses sse2rvv.h to translate SSE2 intrinsics to RISC-V Vector (RVV).
-- On RVV, __m128i is mapped to vint32m1_t which is a sizeless type:
-  - sizeof(__m128i) is ILLEGAL — replace with _SSW_VEC_BYTES (a runtime macro that queries the actual vector register width, works for any VLEN).
-  - NEVER hardcode 16 for the vector byte width. The hardware VLEN may be 128, 256, or larger. Always use _SSW_VEC_BYTES or _SSW_ELEMS_8 instead.
-  - Pointer arithmetic on __m128i* (e.g. ptr + j) is ILLEGAL — use byte-level arithmetic instead: ((__m128i *)((uint8_t *)(ptr) + (j) * _SSW_VEC_BYTES)).
-  - Array indexing like pvH[j] on __m128i* is ILLEGAL — use _mm_load_si128 / _mm_store_si128 with byte-offset pointers.
-  - Declaring __m128i inside structs is ILLEGAL — use a uint8_t buffer and cast as needed.
-  - For segLen calculations with 8-bit elements use _SSW_ELEMS_8, for 16-bit elements use _SSW_ELEMS_8 / 2.
+## Google Highway quick reference
 
-Strategy:
-- Fix ONE function (or one category of error) per response.
-- Do NOT attempt to fix the entire file at once.
+Highway provides portable SIMD via C++ templates:
+- Include `"hwy/highway.h"` and use `HWY_NAMESPACE` / `HWY_BEFORE_NAMESPACE` / `HWY_AFTER_NAMESPACE`.
+- Use the foreach_target pattern (`hwy/foreach_target.h`) for multi-target dispatch.
+- Key types: `hn::ScalableTag<T>` (runtime-width) or `hn::FixedTag<T, N>` (fixed lanes).
+- Operations: `hn::Load`, `hn::Store`, `hn::Add`, `hn::Sub`, `hn::Max`, `hn::Min`,
+  `hn::ShiftRight`, `hn::ShiftLeft`, `hn::Set`, `hn::Zero`, `hn::BitCast`, etc.
+- For 128-bit SSE-equivalent vectors use `hn::FixedTag<uint8_t, 16>` (16 × u8 lanes).
+- Replace `__m128i` with `hn::Vec<hn::FixedTag<T, N>>` or use `auto`.
+- Replace `_mm_*` intrinsics with the corresponding Highway `hn::*` functions.
+- Memory: `hn::Load(tag, ptr)`, `hn::Store(vec, tag, ptr)`.
+- Profile/buffer data should use flat typed arrays (`uint8_t*`, `int16_t*`)
+  instead of `__m128i*` since Highway vectors may be sizeless.
+- Compile with C++17 and `-I<highway_root>`.
+
+## Translation strategy
+
+1. Map each SSE intrinsic to its Highway equivalent.
+2. Replace `__m128i` types with Highway vector types or `auto`.
+3. Replace `__m128i*` pointers with typed pointers (`uint8_t*`, `int16_t*`, etc.)
+   and use `hn::Load` / `hn::Store` with the appropriate tag.
+4. sizeof(__m128i) should be replaced with `hn::Lanes(tag) * sizeof(element_type)`.
+5. Preserve the algorithmic logic exactly — only change the SIMD layer.
+
+## Rules
+
+- Modify only `{target_file}`.
+- Fix ONE error or ONE function per response — keep changes small and incremental.
 - Address the FIRST error shown in the compiler output.
-- If the same pattern (e.g. sizeof(__m128i)) appears in multiple functions, fix it in only ONE function per step.
-- The repair loop will call you again with updated code and any remaining errors.
-
-Rules:
-- Modify only {target_file_name}.
+- The repair loop will call you again with updated code and remaining errors.
 - Preserve existing style unless the fix requires otherwise.
 - Do not change unrelated code.
 - Do not invent APIs, functions, files, or build steps.
-- Keep each response small and focused on the next high-confidence repair step.
 - Prefer the smallest possible diff that fixes the current failure.
-- Prefer a single small hunk over broad rewrites whenever possible.
 - Do not rewrite unchanged lines just to restyle them.
-- If something is ambiguous, make the safest assumption and state it briefly in the summary.
+
+## Output format
 
 Return only:
 1) A short summary sentence.
-2) A single-file unified git diff patch in a fenced ```diff block for {target_file_name}.
+2) A single-file unified git diff patch in a fenced ```diff block for {target_file}.
 
-Patch requirements:
-- The patch must modify exactly one file: {target_file_name}.
-- Use standard diff headers that match this exact path:
-  - `--- a/{target_file_name}`
-  - `+++ b/{target_file_name}`
+{diff_format_example(target_file)}
+
+## Patch requirements
+
+- Use `--- a/{target_file}` and `+++ b/{target_file}`.
 - Each hunk MUST have a proper header: `@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@`
-  where OLD_START is the 1-based line number where the context begins in the original file,
-  OLD_COUNT is the number of lines from the original (context + removed),
-  NEW_START is the corresponding line in the new file,
-  NEW_COUNT is the number of lines in the new version (context + added).
-- Context lines (unchanged) MUST start with a SPACE character and MUST match the actual file exactly.
-- Removed lines start with `-`.
-- Added lines start with `+`.
+- Context lines (unchanged) MUST start with a SPACE and match the actual file exactly.
+- Removed lines start with `-`, added lines start with `+`.
 - Include 3 lines of unchanged context before and after each change.
 - Do not return full-file rewrites.
 - Keep the total patch under 3000 characters.
 
-{diff_format_example(target_file_name)}
+## RISC-V Vector (RVV) reference
 
-Reference material loaded from:
-{REFERENCE_FILE}
+Reference material from: {REFERENCE_FILE}
 
-{load_riscv_reference()}
+{RVV_REFERENCE}
 """.strip()
 
 
-def build_initial_user_prompt(
-    file_name: str,
-    code: str,
-    target_fasta: str,
-    query_fasta: str,
+def build_initial_translation_prompt(
+    target_file: str,
+    source_code: str,
+    build_command: str,
     validation_feedback: str | None = None,
 ) -> str:
+    """Build the first user prompt that asks the LLM to translate or fix the code."""
     validation_section = ""
     if validation_feedback:
         validation_section = f"""
@@ -194,77 +102,67 @@ def build_initial_user_prompt(
 Current validation failure:
 {validation_feedback}
 """.rstrip()
-    return f"""
-Task: Repair this file for the RISC-V validation flow.
+
+    return f"""\
+Task: Translate/repair this file so it compiles and runs on RISC-V using Google Highway.
 
 Goal:
-Make the smallest correct change so the project compiles and runs successfully with the provided validation command.
+Make the smallest correct change so the project compiles and runs successfully.
 
-Repository context:
-- Target file: {file_name}
-- Validation command: make clean && make rvv_cli CC="{RISCVCC}" && {QEMU_RVV} ./rvv_ssw_test "{target_fasta}" "{query_fasta}"
+Context:
+- Target file: {target_file}
+- Build & validation command: {build_command}
 
 What to change:
-- Fix the current implementation in {file_name}.
-- Keep the repair incremental and localized.
-- Prefer the smallest possible patch hunk that addresses the reported failure.
+- Replace x86 SSE intrinsics with Google Highway equivalents.
+- Fix compiler errors shown in the validation feedback below.
+- Keep the repair incremental and localised.
 
 What not to change:
-- Do not modify any file other than {file_name}.
+- Do not modify any file other than {target_file}.
 - Do not refactor unrelated logic.
-- Do not introduce new dependencies or new files.
-
-Acceptance criteria:
-- The resulting patch targets only {file_name}.
-- The change is minimal and directly addresses the current failure mode.
-- The output follows the required format exactly.
+- Do not introduce new dependencies or files.
 
 Current code:
-```c
-{code}
+```cpp
+{source_code}
 ```
 {validation_section}
 
 Output:
 - First, one short summary sentence.
-- Then, a single fenced `diff` block containing only the unified diff for `{file_name}`.
-- The diff must target only `{file_name}`.
-- Use `--- a/{file_name}` and `+++ b/{file_name}`.
-- Each hunk header MUST have correct line numbers: `@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@`
-- Context lines MUST start with a space and MUST exactly match the current file.
-- Include 3 lines of unchanged context before and after each change.
-{diff_format_example(file_name)}
+- Then, a single fenced `diff` block containing only the unified diff for `{target_file}`.
+{diff_format_example(target_file)}
 """.strip()
 
 
-def build_repair_prompt(file_name: str, code: str, validation_feedback: str) -> str:
-    return f"""
+def build_repair_prompt(
+    target_file: str,
+    code: str,
+    validation_feedback: str,
+) -> str:
+    """Build follow-up prompts when previous attempts still have errors."""
+    return f"""\
 Task: Fix the current validation failure in this file.
 
 Goal:
-Make the smallest correct change needed so the project moves closer to passing the RISC-V build/runtime validation flow.
+Make the smallest correct change needed so the project moves closer to passing
+the RISC-V build/runtime validation.
 
-Repository context:
-- Target file: {file_name}
-- Validation flow: compile with the configured RISC-V toolchain and run the provided CLI validation.
+Context:
+- Target file: {target_file}
+- The code has already been partially translated to Google Highway.
 
 What to change:
-- Update only {file_name}.
 - Address the failure indicated below.
 - Prefer the smallest possible patch hunk that fixes the reported failure.
 
 What not to change:
-- Do not modify any file other than {file_name}.
+- Do not modify any file other than {target_file}.
 - Do not refactor unrelated code.
-- Do not introduce new dependencies or new files.
-
-Acceptance criteria:
-- The patch is minimal and localized.
-- The patch targets only {file_name}.
-- The output follows the required format exactly.
 
 Current code:
-```c
+```cpp
 {code}
 ```
 
@@ -273,14 +171,12 @@ Validation failure details:
 
 Output:
 - First, one short summary sentence.
-- Then, a single fenced `diff` block containing only the unified diff for `{file_name}`.
-- Use `--- a/{file_name}` and `+++ b/{file_name}`.
-- Each hunk header MUST have correct line numbers: `@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@`
-- Context lines MUST start with a space and MUST exactly match the current file.
-- Include 3 lines of unchanged context before and after each change.
-{diff_format_example(file_name)}
+- Then, a single fenced `diff` block containing only the unified diff for `{target_file}`.
+{diff_format_example(target_file)}
 """.strip()
 
 
-def build_diff_format_feedback(file_name: str, code: str, error_message: str) -> str:
+def build_diff_format_feedback(
+    file_name: str, code: str, error_message: str
+) -> str:
     return diff_error_feedback(file_name, code, error_message)

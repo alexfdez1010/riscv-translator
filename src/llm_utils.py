@@ -1,29 +1,24 @@
 import os
-import re
 import json
 import subprocess
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
-
 from src.llm_types import LLM, Message, llm_fn
 
 from src.config import (
     LLM_BASE_URL,
+    LLM_MAX_COMPLETION_TOKENS,
     LLM_REASONING_EFFORT,
     LLM_TEMPERATURE,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
 )
 from src.logger import get_logger
 
-load_dotenv()
-
 logger = get_logger(__name__)
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:free")
 
 # ---------------------------------------------------------------------------
 # LLM setup
@@ -59,7 +54,7 @@ def _ensure_ssh_tunnel(base_url: str) -> bool:
     return _wait_for_endpoint(base_url)
 
 
-def _call_openrouter(payload: dict, max_retries: int = 3) -> dict:
+def _call_openrouter(payload: dict, max_retries: int = 5) -> dict:
     """Send a request to the OpenRouter API with retry on 429."""
     endpoint = f"{OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
     payload = {**payload, "model": OPENROUTER_MODEL}
@@ -79,8 +74,8 @@ def _call_openrouter(payload: dict, max_retries: int = 3) -> dict:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             if exc.code == 429 and attempt < max_retries:
-                wait = 2 ** attempt * 10
-                logger.debug("OpenRouter 429; retrying in %ds (%d/%d)", wait, attempt + 1, max_retries)
+                wait = 2 ** attempt * 15
+                logger.info("OpenRouter 429; retrying in %ds (%d/%d)", wait, attempt + 1, max_retries)
                 time.sleep(wait)
                 continue
             raise
@@ -110,7 +105,7 @@ def create_llm() -> LLM:
                 for message in messages
             ],
             "temperature": LLM_TEMPERATURE,
-            "reasoning_effort": LLM_REASONING_EFFORT,
+            "max_completion_tokens": LLM_MAX_COMPLETION_TOKENS,
         }
 
         # If we already fell back to OpenRouter in a previous call, keep using it.
@@ -151,24 +146,3 @@ def create_llm() -> LLM:
         return _extract_content(body)
 
     return _inference_llm
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract C code from LLM response
-# ---------------------------------------------------------------------------
-
-
-def extract_code(response: str) -> str | None:
-    pattern = r"```(?:c|C)?\s*\n(.*?)```"
-    matches = re.findall(pattern, response, re.DOTALL)
-    if matches:
-        code = matches[0].strip()
-        if "sequence_alignment_wavefront" in code:
-            return code
-    if "sequence_alignment_wavefront" in response:
-        lines = response.strip().split("\n")
-        code_lines = [line for line in lines if not line.startswith("```")]
-        code = "\n".join(code_lines).strip()
-        if "#include" in code or "void " in code:
-            return code
-    return None

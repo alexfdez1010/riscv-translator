@@ -1,4 +1,11 @@
-"""Shared validation result and hardware validators for SSW repair/evolution."""
+"""Generic compile-and-run validators for the SSE→RISC-V translation pipeline.
+
+Two validators:
+  - DockerValidator: compile + run inside Docker with QEMU emulation.
+  - SSHValidator:    compile + run on real RISC-V hardware via SSH.
+
+Both accept *commands* as parameters so they are not tied to any specific library.
+"""
 
 import os
 import subprocess
@@ -7,24 +14,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.config import (
-    BENCHMARK_FASTA,
+    DOCKER_IMAGE,
     REMOTE_DIR,
     SSH_HOST,
-    SSW_BENCH_FILE,
-    SSW_DIR,
+    VALIDATION_TIMEOUT_SECONDS,
 )
 from src.logger import get_logger
 
 logger = get_logger(__name__)
 
 MAX_OUTPUT_CHARS = 16000
-
-DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "luispimo/riscv-toolchain:arm64-2025-10-20")
-RISCVCC = os.getenv("RISCVCC", "riscv64-unknown-elf-gcc")
-QEMU_RVV = os.getenv(
-    "QEMU_RVV",
-    "qemu-riscv64 -cpu rv64,v=on,vext_spec=v1.0,vlen=128,rvv_ta_all_1s=on",
-)
 
 
 @dataclass(slots=True)
@@ -63,29 +62,23 @@ def _infer_stage(stdout: str, stderr: str) -> str:
     return "runtime"
 
 
-class InitialCodeValidator:
-    """Validates an SSW snapshot by building and running inside Docker/QEMU."""
+class DockerValidator:
+    """Validates a workspace by building and running inside Docker/QEMU.
+
+    The caller provides *build_command* — a shell command that compiles and
+    runs the translated code.  This validator mounts the workspace into the
+    Docker container and executes the command.
+    """
+
+    def __init__(self, docker_image: str = DOCKER_IMAGE):
+        self.docker_image = docker_image
 
     def validate(
         self,
-        snapshot: "SourceSnapshot",  # noqa: F821 — forward ref to repair.py type
         workspace_dir: Path,
-        target_fasta: str,
-        query_fasta: str,
+        build_command: str,
     ) -> ValidationResult:
-        from src.repair import materialize_snapshot  # avoid circular import
-
-        materialize_snapshot(workspace_dir, snapshot)
-        command = (
-            "make clean && "
-            f'make rvv_example CC="{RISCVCC}" && '
-            f'{QEMU_RVV} ./rvv_example && '
-            f'echo "=== rvv_example PASSED ===" && '
-            f'( make rvv_cli CC="{RISCVCC}" && '
-            f'{QEMU_RVV} ./rvv_ssw_test "{target_fasta}" "{query_fasta}" '
-            f'|| echo "=== rvv_cli skipped (zlib missing) ===" )'
-        )
-        logger.debug("Running initial_code validation in %s", workspace_dir)
+        logger.debug("Running Docker validation in %s", workspace_dir)
         try:
             result = subprocess.run(
                 [
@@ -93,23 +86,28 @@ class InitialCodeValidator:
                     "run",
                     "--rm",
                     "--mount",
-                    f"type=bind,source={workspace_dir},target=/workspace/initial_code",
+                    f"type=bind,source={workspace_dir},target=/workspace",
                     "-w",
-                    "/workspace/initial_code",
-                    "-e",
-                    f"RISCVCC={RISCVCC}",
-                    "-e",
-                    f"QEMU_RVV={QEMU_RVV}",
-                    DOCKER_IMAGE,
+                    "/workspace",
+                    self.docker_image,
                     "bash",
                     "-lc",
-                    command,
+                    build_command,
                 ],
                 capture_output=True,
                 text=True,
+                timeout=VALIDATION_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return ValidationResult(
+                ok=False,
+                stage="timeout",
+                returncode=None,
+                stdout=getattr(exc, "stdout", "") or "",
+                stderr=getattr(exc, "stderr", "") or "Docker validation timed out.",
             )
         except Exception as exc:
-            logger.warning("Validation execution failed: %s", exc)
+            logger.warning("Docker validation execution failed: %s", exc)
             return ValidationResult(
                 ok=False,
                 stage="internal-error",
@@ -117,8 +115,9 @@ class InitialCodeValidator:
                 stdout="",
                 stderr=str(exc),
             )
+
         if result.returncode == 0:
-            logger.info("Validation passed")
+            logger.info("Docker validation passed")
             return ValidationResult(
                 ok=True,
                 stage="validation",
@@ -126,9 +125,10 @@ class InitialCodeValidator:
                 stdout=result.stdout,
                 stderr=result.stderr,
             )
+
         stage = _infer_stage(result.stdout, result.stderr)
         logger.debug(
-            "Validation failed at stage %s with return code %s",
+            "Docker validation failed at stage %s with return code %s",
             stage,
             result.returncode,
         )
@@ -141,33 +141,40 @@ class InitialCodeValidator:
         )
 
 
-class SSHSSWValidator:
-    """Validates a candidate ssw.c by compiling and running on real RISC-V
-    hardware via SSH.  Catches problems (e.g. VLEN mismatch) that QEMU
-    emulation with a fixed VLEN may not reveal."""
+class SSHValidator:
+    """Validates translated code on real RISC-V hardware via SSH.
 
-    _REMOTE_SSW_DIR = f"{REMOTE_DIR}/ssw_repair"
+    The caller provides:
+      - *local_files*: list of local file paths to upload.
+      - *compile_command*: shell command to compile on the remote host.
+      - *run_command*: shell command to run the compiled binary.
 
-    def __init__(self):
+    Returns ok=True (skipped) when SSH is unavailable so the pipeline
+    can still function without hardware.
+    """
+
+    def __init__(self, ssh_host: str = SSH_HOST, remote_dir: str = REMOTE_DIR):
+        self.ssh_host = ssh_host
+        self.remote_dir = remote_dir
         self._available = self._check_ssh()
         if self._available:
             self._setup_remote()
 
-    @staticmethod
-    def _check_ssh() -> bool:
+    def _check_ssh(self) -> bool:
         try:
             result = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", SSH_HOST, "echo ok"],
+                ["ssh", "-o", "ConnectTimeout=5", self.ssh_host, "echo ok"],
                 capture_output=True,
                 timeout=10,
                 text=True,
             )
             ok = result.returncode == 0 and "ok" in result.stdout
             if ok:
-                logger.info("SSH host %s is reachable", SSH_HOST)
+                logger.info("SSH host %s is reachable", self.ssh_host)
             else:
                 logger.warning(
-                    "SSH host %s is not reachable; SSH validation disabled", SSH_HOST
+                    "SSH host %s is not reachable; SSH validation disabled",
+                    self.ssh_host,
                 )
             return ok
         except Exception as exc:
@@ -178,45 +185,46 @@ class SSHSSWValidator:
 
     def _setup_remote(self) -> None:
         subprocess.run(
-            ["ssh", SSH_HOST, f"mkdir -p {self._REMOTE_SSW_DIR}"],
+            ["ssh", self.ssh_host, f"mkdir -p {self.remote_dir}"],
             capture_output=True,
             timeout=30,
         )
-        for name in ("ssw.h", "sse2rvv.h"):
-            src = SSW_DIR / name
-            if src.exists():
-                subprocess.run(
-                    ["scp", str(src), f"{SSH_HOST}:{self._REMOTE_SSW_DIR}/{name}"],
-                    capture_output=True,
-                    timeout=30,
-                )
-        if SSW_BENCH_FILE.exists():
-            subprocess.run(
-                [
-                    "scp",
-                    str(SSW_BENCH_FILE),
-                    f"{SSH_HOST}:{self._REMOTE_SSW_DIR}/bench_ssw.c",
-                ],
-                capture_output=True,
-                timeout=30,
-            )
-        if BENCHMARK_FASTA.exists():
-            subprocess.run(
-                [
-                    "scp",
-                    str(BENCHMARK_FASTA),
-                    f"{SSH_HOST}:{self._REMOTE_SSW_DIR}/dataset.fa",
-                ],
+
+    def upload(self, local_paths: list[Path]) -> ValidationResult | None:
+        """Upload files and directories to the remote workspace. Returns a failure result or None on success."""
+        for local_path in local_paths:
+            if not local_path.exists():
+                continue
+            cmd = ["scp"]
+            if local_path.is_dir():
+                cmd.append("-r")
+            cmd += [
+                str(local_path),
+                f"{self.ssh_host}:{self.remote_dir}/{local_path.name}",
+            ]
+            result = subprocess.run(
+                cmd,
                 capture_output=True,
                 timeout=120,
+                text=True,
             )
-        logger.info(
-            "SSH validation workspace set up at %s:%s", SSH_HOST, self._REMOTE_SSW_DIR
-        )
+            if result.returncode != 0:
+                return ValidationResult(
+                    ok=False,
+                    stage="ssh-upload",
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+        return None
 
-    def validate(self, ssw_code: str) -> ValidationResult:
-        """Compile and run on real hardware.  Returns ok=True (skipped) when
-        SSH is unavailable so the repair loop can still function."""
+    def validate(
+        self,
+        local_files: list[Path],
+        compile_command: str,
+        run_command: str,
+    ) -> ValidationResult:
+        """Upload, compile, and run on real hardware."""
         if not self._available:
             return ValidationResult(
                 ok=True,
@@ -227,35 +235,12 @@ class SSHSSWValidator:
             )
 
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".c", delete=False
-            ) as f:
-                f.write(ssw_code)
-                local_tmp = f.name
+            upload_err = self.upload(local_files)
+            if upload_err is not None:
+                return upload_err
 
-            scp_result = subprocess.run(
-                ["scp", local_tmp, f"{SSH_HOST}:{self._REMOTE_SSW_DIR}/ssw.c"],
-                capture_output=True,
-                timeout=30,
-                text=True,
-            )
-            os.unlink(local_tmp)
-            if scp_result.returncode != 0:
-                return ValidationResult(
-                    ok=False,
-                    stage="ssh-upload",
-                    returncode=scp_result.returncode,
-                    stdout=scp_result.stdout,
-                    stderr=scp_result.stderr,
-                )
-
-            compile_cmd = (
-                f"cd {self._REMOTE_SSW_DIR} && "
-                f"clang -O2 -march=rv64gcv -c -o ssw.o ssw.c 2>&1 && "
-                f"clang -O2 -march=rv64gcv -o bench_ssw bench_ssw.c ssw.o -lm 2>&1"
-            )
             comp = subprocess.run(
-                ["ssh", SSH_HOST, compile_cmd],
+                ["ssh", self.ssh_host, f"cd {self.remote_dir} && {compile_command}"],
                 capture_output=True,
                 timeout=60,
                 text=True,
@@ -269,9 +254,8 @@ class SSHSSWValidator:
                     stderr=comp.stderr,
                 )
 
-            run_cmd = f"cd {self._REMOTE_SSW_DIR} && ./bench_ssw dataset.fa 2>&1"
             run = subprocess.run(
-                ["ssh", SSH_HOST, run_cmd],
+                ["ssh", self.ssh_host, f"cd {self.remote_dir} && {run_command}"],
                 capture_output=True,
                 timeout=300,
                 text=True,
