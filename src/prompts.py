@@ -37,6 +37,35 @@ intrinsics using RISC-V Vector (RVV) instructions.  It is analogous to
 - The existing SSE code should compile with minimal modifications once the
   include is swapped.
 
+## CRITICAL: sizeof(__m128i) and pointer arithmetic on RVV types
+
+On RISC-V, `__m128i` maps to a *scalable* vector type (`vint32m1_t`) whose
+size depends on the hardware vector length (VLEN).  The compiler will reject
+`sizeof(__m128i)` and pointer arithmetic like `ptr + i` on `__m128i*`.
+
+**Do NOT hardcode `16` or any fixed byte size.**  The code must work on
+hardware with any VLEN (128, 256, 512, …).
+
+sse2rvv.h provides a runtime helper:
+
+    SSE2RVV_VTYPE_SIZE   — returns the byte size of one vector register
+
+Use it as a drop-in replacement for `sizeof(__m128i)`:
+
+- **Allocation**:  `malloc(n * SSE2RVV_VTYPE_SIZE)` instead of
+  `malloc(n * sizeof(__m128i))`.
+- **Pointer arithmetic**:  cast to `uint8_t*` and offset by
+  `i * SSE2RVV_VTYPE_SIZE` instead of `ptr[i]` or `ptr + i`.
+  Example:
+  ```c
+  // WRONG — compiler error or hardcoded size:
+  __m128i v = pvHStore[j];
+  // CORRECT — VLEN-independent:
+  __m128i v = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
+  ```
+- **calloc**: `calloc(n, SSE2RVV_VTYPE_SIZE)` instead of
+  `calloc(n, sizeof(__m128i))`.
+
 ## Translation strategy
 
 Because sse2rvv.h is a drop-in replacement, the translation requires only
