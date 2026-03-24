@@ -11,7 +11,6 @@ load_dotenv()
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 REFERENCE_FILE = PROJECT_DIR / "docs" / "riscv-reference" / "reference.md"
-HIGHWAY_DIR = PROJECT_DIR / "highway"
 
 # ---------------------------------------------------------------------------
 # SSH
@@ -21,23 +20,14 @@ SSH_HOST = os.getenv("SSH_HOST", "final")
 REMOTE_DIR = os.getenv("REMOTE_DIR", "/tmp/sse2rvv")
 
 # ---------------------------------------------------------------------------
-# LLM
-# ---------------------------------------------------------------------------
-
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:30000/v1")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "sk-no-key-required")
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
-LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
-LLM_MAX_COMPLETION_TOKENS = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "5000"))
-
-# ---------------------------------------------------------------------------
-# LLM Fallback
+# LLM (OpenRouter)
 # ---------------------------------------------------------------------------
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+LLM_MAX_COMPLETION_TOKENS = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "5000"))
 
 # ---------------------------------------------------------------------------
 # Translation pipeline

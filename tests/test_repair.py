@@ -1,12 +1,11 @@
-"""Tests for the generic SSE→RISC-V translation pipeline (src/repair.py)."""
+"""Tests for the generic SSE→RISC-V translation pipeline using sse2rvv.h (src/repair.py)."""
 
 import pytest
 
 from src import repair
 from src.config import REFERENCE_FILE
-from src.diff_utils import diff_error_feedback, validate_single_file_diff
+from src.diff_utils import search_replace_error_feedback
 from src.prompts import (
-    build_diff_format_feedback,
     build_initial_translation_prompt,
     build_repair_prompt,
     build_system_prompt,
@@ -79,14 +78,12 @@ def _patch_infra(monkeypatch, tmp_path, *, docker_ok=False):
 # ---------------------------------------------------------------------------
 
 
-def test_build_system_prompt_includes_highway_guidance():
+def test_build_system_prompt_includes_sse2rvv_guidance():
     prompt = build_system_prompt("lib.cpp")
-    assert "Google Highway" in prompt
-    assert "hwy/highway.h" in prompt
+    assert "sse2rvv.h" in prompt
     assert "Modify only `lib.cpp`" in prompt
-    assert "--- a/lib.cpp" in prompt
-    assert "+++ b/lib.cpp" in prompt
-    assert "@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@" in prompt
+    assert "<<<<<<< SEARCH" in prompt
+    assert ">>>>>>> REPLACE" in prompt
 
 
 def test_build_system_prompt_includes_rvv_reference():
@@ -114,60 +111,6 @@ def test_apply_content_to_snapshot_rejects_unknown_file():
 
 
 # ---------------------------------------------------------------------------
-# Diff extraction and application tests
-# ---------------------------------------------------------------------------
-
-
-def test_extract_diff_from_fenced_response():
-    response = """```diff
-diff --git a/lib.cpp b/lib.cpp
---- a/lib.cpp
-+++ b/lib.cpp
-@@ -1 +1 @@
--old
-+new
-```"""
-    assert repair.extract_diff(response) == "\n".join(response.splitlines()[1:-1])
-
-
-def test_validate_single_file_diff_accepts_expected_format():
-    patch = """diff --git a/lib.cpp b/lib.cpp
---- a/lib.cpp
-+++ b/lib.cpp
-@@ -1 +1 @@
--old
-+new
-"""
-    validate_single_file_diff(patch, "lib.cpp")
-
-
-def test_validate_single_file_diff_rejects_wrong_headers():
-    patch = """diff --git a/other.cpp b/other.cpp
---- a/other.cpp
-+++ b/other.cpp
-@@ -1 +1 @@
--old
-+new
-"""
-    with pytest.raises(ValueError, match="Patch must target only lib.cpp"):
-        validate_single_file_diff(patch, "lib.cpp")
-
-
-def test_apply_patch_to_snapshot_updates_target_file():
-    snapshot = repair.SourceSnapshot(files={"lib.cpp": "old\n", "lib.h": "keep\n"})
-    patch = """diff --git a/lib.cpp b/lib.cpp
---- a/lib.cpp
-+++ b/lib.cpp
-@@ -1 +1 @@
--old
-+new
-"""
-    updated = repair.apply_patch_to_snapshot(snapshot, "lib.cpp", patch)
-    assert updated.files["lib.cpp"] == "new\n"
-    assert updated.files["lib.h"] == "keep\n"
-
-
-# ---------------------------------------------------------------------------
 # Prompt format tests
 # ---------------------------------------------------------------------------
 
@@ -176,11 +119,10 @@ def test_build_initial_translation_prompt_structure():
     prompt = build_initial_translation_prompt(
         "lib.cpp", "int main() {}\n", "make all"
     )
-    assert "Translate/repair" in prompt
-    assert "Google Highway" in prompt
+    assert "sse2rvv.h" in prompt
     assert "lib.cpp" in prompt
     assert "make all" in prompt
-    assert "--- a/lib.cpp" in prompt
+    assert "<<<<<<< SEARCH" in prompt
 
 
 def test_build_initial_translation_prompt_with_feedback():
@@ -199,13 +141,13 @@ def test_build_repair_prompt_structure():
     )
     assert "Fix the current validation failure" in prompt
     assert "error: broken" in prompt
-    assert "--- a/lib.cpp" in prompt
+    assert "<<<<<<< SEARCH" in prompt
 
 
-def test_build_diff_format_feedback_structure():
-    prompt = diff_error_feedback("lib.cpp", "int main() {}\n", "missing header")
-    assert "missing header" in prompt
-    assert "--- a/lib.cpp" in prompt
+def test_build_edit_format_feedback_structure():
+    prompt = search_replace_error_feedback("lib.cpp", "int main() {}\n", "search text not found")
+    assert "search text not found" in prompt
+    assert "<<<<<<< SEARCH" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -245,28 +187,10 @@ def test_infer_stage_runtime():
 def test_generate_valid_file_retries_with_feedback(monkeypatch, tmp_path):
     responses = iter(
         [
-            """Add a required include before changing anything else.
-
-```diff
-diff --git a/lib.cpp b/lib.cpp
---- a/lib.cpp
-+++ b/lib.cpp
-@@ -1 +1,2 @@
--seed
-+#include <stdio.h>
-+seed
-```""",
-            """Replace the placeholder line with a stub.
-
-```diff
-diff --git a/lib.cpp b/lib.cpp
---- a/lib.cpp
-+++ b/lib.cpp
-@@ -1,2 +1,2 @@
- #include <stdio.h>
--seed
-+void foo() {}
-```""",
+            "Add a required include before changing anything else.\n\n"
+            "<<<<<<< SEARCH\nseed\n=======\n#include <stdio.h>\nseed\n>>>>>>> REPLACE",
+            "Replace the placeholder line with a stub.\n\n"
+            "<<<<<<< SEARCH\nseed\n=======\nvoid foo() {}\n>>>>>>> REPLACE",
         ]
     )
     validations = iter(
@@ -405,7 +329,8 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
     )
 
     assert rc == 1
-    assert not output_dir.exists()
+    # Best-effort output is written even on failure
+    assert output_dir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -414,8 +339,7 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
 
 
 def test_default_build_command_generates_compile_command():
-    cmd = repair.default_build_command("ssw_hwy.cpp")
-    assert "ssw_hwy.cpp" in cmd
+    cmd = repair.default_build_command("ssw.c")
+    assert "*.c" in cmd
     assert "-std=c++17" in cmd
-    assert "highway" in cmd
     assert "Compilation succeeded" in cmd

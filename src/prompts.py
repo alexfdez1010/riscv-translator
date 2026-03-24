@@ -1,12 +1,12 @@
-"""Prompt construction for the generic SSE→Highway RISC-V translation pipeline.
+"""Prompt construction for the generic SSE→RISC-V translation pipeline.
 
-All prompts are library-agnostic: they guide the LLM to translate x86 SSE
-intrinsics to Google Highway SIMD code targeting RISC-V, and to fix compiler
-errors based on feedback — without any hardcoded, library-specific fixes.
+All prompts are library-agnostic: they guide the LLM to port x86 SSE/SSE2
+code to RISC-V using the sse2rvv.h drop-in compatibility header, and to fix
+compiler errors based on feedback — without any hardcoded, library-specific fixes.
 """
 
 from src.config import REFERENCE_FILE, RVV_REFERENCE
-from src.diff_utils import diff_error_feedback, diff_format_example
+from src.diff_utils import search_replace_error_feedback, search_replace_format_example
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -18,67 +18,86 @@ logger = get_logger(__name__)
 
 
 def build_system_prompt(target_file: str) -> str:
-    """Build the system prompt for SSE→Highway translation/repair."""
+    """Build the system prompt for SSE→sse2rvv translation/repair."""
     return f"""\
 You are an expert systems programmer specialising in SIMD portability.
-Your task is to incrementally translate and repair C/C++ code that uses
-x86 SSE/SSE2 intrinsics so that it compiles and runs correctly on RISC-V
-using the Google Highway SIMD library.
+Your task is to incrementally repair C/C++ code that uses x86 SSE/SSE2
+intrinsics so that it compiles and runs correctly on RISC-V using the
+**sse2rvv.h** drop-in compatibility header.
 
-## Google Highway quick reference
+## sse2rvv.h overview
 
-Highway provides portable SIMD via C++ templates:
-- Include `"hwy/highway.h"` and use `HWY_NAMESPACE` / `HWY_BEFORE_NAMESPACE` / `HWY_AFTER_NAMESPACE`.
-- Use the foreach_target pattern (`hwy/foreach_target.h`) for multi-target dispatch.
-- Key types: `hn::ScalableTag<T>` (runtime-width) or `hn::FixedTag<T, N>` (fixed lanes).
-- Operations: `hn::Load`, `hn::Store`, `hn::Add`, `hn::Sub`, `hn::Max`, `hn::Min`,
-  `hn::ShiftRight`, `hn::ShiftLeft`, `hn::Set`, `hn::Zero`, `hn::BitCast`, etc.
-- For 128-bit SSE-equivalent vectors use `hn::FixedTag<uint8_t, 16>` (16 × u8 lanes).
-- Replace `__m128i` with `hn::Vec<hn::FixedTag<T, N>>` or use `auto`.
-- Replace `_mm_*` intrinsics with the corresponding Highway `hn::*` functions.
-- Memory: `hn::Load(tag, ptr)`, `hn::Store(vec, tag, ptr)`.
-- Profile/buffer data should use flat typed arrays (`uint8_t*`, `int16_t*`)
-  instead of `__m128i*` since Highway vectors may be sizeless.
-- Compile with C++17 and `-I<highway_root>`.
+`sse2rvv.h` is a header-only translation layer that re-implements SSE/SSE2
+intrinsics using RISC-V Vector (RVV) instructions.  It is analogous to
+`sse2neon.h` for ARM NEON.
+
+- Include `"sse2rvv.h"` instead of any x86 SSE headers.
+- All standard SSE types (`__m128i`, `__m128`, `__m128d`) and intrinsic
+  functions (`_mm_*`) are provided by sse2rvv.h — no API changes needed.
+- The existing SSE code should compile with minimal modifications once the
+  include is swapped.
 
 ## Translation strategy
 
-1. Map each SSE intrinsic to its Highway equivalent.
-2. Replace `__m128i` types with Highway vector types or `auto`.
-3. Replace `__m128i*` pointers with typed pointers (`uint8_t*`, `int16_t*`, etc.)
-   and use `hn::Load` / `hn::Store` with the appropriate tag.
-4. sizeof(__m128i) should be replaced with `hn::Lanes(tag) * sizeof(element_type)`.
-5. Preserve the algorithmic logic exactly — only change the SIMD layer.
+Because sse2rvv.h is a drop-in replacement, the translation requires only
+**minor, localised changes**:
+
+1. Replace x86 SSE `#include` directives (`<emmintrin.h>`, `<xmmintrin.h>`,
+   `<smmintrin.h>`, `<immintrin.h>`, etc.) with `#include "sse2rvv.h"`.
+2. Remove or guard any `#ifdef __SSE2__` / `#ifdef __SSE__` preprocessor
+   conditionals that would disable the SIMD code paths on non-x86 targets.
+3. Fix any remaining compiler errors — these are typically minor issues such
+   as missing includes, type mismatches, or platform-specific assumptions.
+
+## CRITICAL: Keep changes minimal
+
+- Do NOT rewrite SSE intrinsics into a different API — sse2rvv.h already
+  provides them.
+- Do NOT change algorithmic logic, data structures, or function signatures.
+- Only touch code that the compiler actually complains about.
+- Each search/replace block should be as small as possible — a few lines at
+  most.  Prefer many small blocks over one large block.
 
 ## Rules
 
 - Modify only `{target_file}`.
-- Fix ONE error or ONE function per response — keep changes small and incremental.
-- Address the FIRST error shown in the compiler output.
+- Focus on the specific compiler error(s) shown in the feedback.
+- Make the smallest correct change that fixes each error.
 - The repair loop will call you again with updated code and remaining errors.
 - Preserve existing style unless the fix requires otherwise.
 - Do not change unrelated code.
 - Do not invent APIs, functions, files, or build steps.
-- Prefer the smallest possible diff that fixes the current failure.
 - Do not rewrite unchanged lines just to restyle them.
 
 ## Output format
 
 Return only:
 1) A short summary sentence.
-2) A single-file unified git diff patch in a fenced ```diff block for {target_file}.
+2) One or more search/replace blocks.
 
-{diff_format_example(target_file)}
+Each block has this exact format:
 
-## Patch requirements
+<<<<<<< SEARCH
+exact lines from the current file to find
+=======
+replacement lines
+>>>>>>> REPLACE
 
-- Use `--- a/{target_file}` and `+++ b/{target_file}`.
-- Each hunk MUST have a proper header: `@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@`
-- Context lines (unchanged) MUST start with a SPACE and match the actual file exactly.
-- Removed lines start with `-`, added lines start with `+`.
-- Include 3 lines of unchanged context before and after each change.
-- Do not return full-file rewrites.
-- Keep the total patch under 3000 characters.
+{search_replace_format_example()}
+
+## Edit requirements
+
+- The SEARCH section must be copied EXACTLY from the current file
+  (same indentation, same whitespace, character for character).
+- The REPLACE section must be DIFFERENT from SEARCH — every block must
+  actually change something.  Never emit a block where search == replace.
+- Each SEARCH text must appear exactly once in the file.  If the same
+  lines appear in multiple places, include more surrounding context lines
+  to make the SEARCH unique.
+- You may use multiple search/replace blocks for changes in different
+  parts of the file.
+- Do NOT modify unrelated code.
+- Keep changes focused and small — only fix what the compiler reports.
 
 ## RISC-V Vector (RVV) reference
 
@@ -104,7 +123,7 @@ Current validation failure:
 """.rstrip()
 
     return f"""\
-Task: Translate/repair this file so it compiles and runs on RISC-V using Google Highway.
+Task: Fix this file so it compiles and runs on RISC-V using sse2rvv.h.
 
 Goal:
 Make the smallest correct change so the project compiles and runs successfully.
@@ -114,14 +133,15 @@ Context:
 - Build & validation command: {build_command}
 
 What to change:
-- Replace x86 SSE intrinsics with Google Highway equivalents.
+- Replace x86 SSE headers with `#include "sse2rvv.h"`.
 - Fix compiler errors shown in the validation feedback below.
-- Keep the repair incremental and localised.
+- Keep changes minimal and localised — sse2rvv.h provides all SSE intrinsics.
 
 What not to change:
 - Do not modify any file other than {target_file}.
 - Do not refactor unrelated logic.
 - Do not introduce new dependencies or files.
+- Do not rewrite SSE intrinsics — sse2rvv.h handles them.
 
 Current code:
 ```cpp
@@ -131,8 +151,8 @@ Current code:
 
 Output:
 - First, one short summary sentence.
-- Then, a single fenced `diff` block containing only the unified diff for `{target_file}`.
-{diff_format_example(target_file)}
+- Then, one or more search/replace blocks with the changes.
+{search_replace_format_example()}
 """.strip()
 
 
@@ -151,11 +171,12 @@ the RISC-V build/runtime validation.
 
 Context:
 - Target file: {target_file}
-- The code has already been partially translated to Google Highway.
+- The code uses sse2rvv.h as a drop-in SSE→RISC-V compatibility layer.
 
 What to change:
 - Address the failure indicated below.
-- Prefer the smallest possible patch hunk that fixes the reported failure.
+- Prefer the smallest possible patch that fixes the reported failure.
+- Do NOT rewrite SSE intrinsics — sse2rvv.h already provides them.
 
 What not to change:
 - Do not modify any file other than {target_file}.
@@ -171,12 +192,12 @@ Validation failure details:
 
 Output:
 - First, one short summary sentence.
-- Then, a single fenced `diff` block containing only the unified diff for `{target_file}`.
-{diff_format_example(target_file)}
+- Then, one or more search/replace blocks with the changes.
+{search_replace_format_example()}
 """.strip()
 
 
-def build_diff_format_feedback(
+def build_edit_format_feedback(
     file_name: str, code: str, error_message: str
 ) -> str:
-    return diff_error_feedback(file_name, code, error_message)
+    return search_replace_error_feedback(file_name, code, error_message)

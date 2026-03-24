@@ -1,18 +1,19 @@
-"""Generic SSE→RISC-V Highway translation pipeline.
+"""Generic SSE→RISC-V translation pipeline using sse2rvv.h.
 
-Translates C/C++ source files that use x86 SSE intrinsics into Google Highway
-SIMD code targeting RISC-V.  Uses an LLM in a compile-fix loop:
+Ports C/C++ source files that use x86 SSE intrinsics to RISC-V by swapping
+SSE headers with the sse2rvv.h drop-in compatibility header and fixing any
+remaining compiler errors via an LLM compile-fix loop:
 
   1. Start with SSE source code in a workspace.
-  2. LLM proposes incremental diffs to translate/fix the code.
-  3. Validate by compiling + running in Docker/QEMU (simulator).
-  4. If errors, feed compiler output back to the LLM and loop.
-  5. Once the simulator passes, validate on real hardware via SSH.
-  6. Loop until fully passing or max steps exhausted.
+  2. Pre-process: replace SSE headers with ``#include "sse2rvv.h"``.
+  3. LLM proposes minimal diffs to fix remaining compilation issues.
+  4. Validate by compiling + running in Docker/QEMU (simulator).
+  5. If errors, feed compiler output back to the LLM and loop.
+  6. Once the simulator passes, validate on real hardware via SSH.
+  7. Loop until fully passing or max steps exhausted.
 
-On success the entire workspace (all source files + a Makefile) is
-written to the output directory so the result is self-contained and
-ready to compile.
+On success the entire workspace (all source files) is written to the
+output directory so the result is self-contained and ready to compile.
 """
 
 import argparse
@@ -28,14 +29,14 @@ from src.config import (
     LLM_VALIDATION_RETRIES,
     PROJECT_DIR,
     REACT_MAX_STEPS,
-    SIMULATOR,
     RISCVCXX,
+    SIMULATOR,
 )
-from src.diff_utils import apply_patch, extract_diff
+from src.diff_utils import apply_search_replace, extract_search_replace
 from src.llm_utils import create_llm
 from src.logger import configure_logging, get_logger
 from src.prompts import (
-    build_diff_format_feedback,
+    build_edit_format_feedback,
     build_initial_translation_prompt,
     build_repair_prompt,
     build_system_prompt,
@@ -48,7 +49,7 @@ from src.validators import (
 
 logger = get_logger(__name__)
 
-HIGHWAY_DIR = PROJECT_DIR / "highway"
+SSE2RVV_HEADER = PROJECT_DIR / "initial_code" / "sse2rvv.h"
 MAX_OUTPUT_CHARS = 16000
 
 
@@ -59,10 +60,10 @@ def truncate_for_log(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
 
 
 # ---------------------------------------------------------------------------
-# SSE → Highway header pre-processing
+# SSE → sse2rvv.h header pre-processing
 # ---------------------------------------------------------------------------
 
-# SSE headers to replace with Highway includes
+# SSE headers to replace with sse2rvv.h
 _SSE_HEADER_RE = re.compile(
     r'^\s*#\s*include\s*<\s*('
     r'emmintrin\.h|xmmintrin\.h|smmintrin\.h|immintrin\.h|'
@@ -71,42 +72,39 @@ _SSE_HEADER_RE = re.compile(
     re.MULTILINE,
 )
 
-_HIGHWAY_INCLUDES = """\
-#include "hwy/highway.h"
-#include "hwy/aligned_allocator.h"\
-"""
+_SSE2RVV_INCLUDE = '#include "sse2rvv.h"'
 
 
 def replace_sse_headers(content: str) -> str:
-    """Mechanically replace SSE #include directives with Highway includes.
+    """Mechanically replace SSE #include directives with sse2rvv.h.
 
     This is a best-effort pre-processing step that runs before the LLM.
-    It only touches the #include lines — the LLM handles intrinsic translation.
+    It only touches the #include lines — sse2rvv.h provides all SSE intrinsics.
     """
     if not _SSE_HEADER_RE.search(content):
         return content
 
-    # Replace the first SSE header with Highway includes, remove the rest
+    # Replace the first SSE header with sse2rvv.h include, remove the rest
     replaced_first = False
 
     def _replacer(m: re.Match) -> str:
         nonlocal replaced_first
         if not replaced_first:
             replaced_first = True
-            return _HIGHWAY_INCLUDES
+            return _SSE2RVV_INCLUDE
         return ""
 
     return _SSE_HEADER_RE.sub(_replacer, content)
 
 
 def preprocess_snapshot(snapshot: "SourceSnapshot") -> "SourceSnapshot":
-    """Apply mechanical SSE→Highway header replacement to all source files."""
+    """Apply mechanical SSE→sse2rvv.h header replacement to all source files."""
     updated = {}
     for name, content in snapshot.files.items():
         if name.endswith((".c", ".cpp", ".cc", ".cxx", ".h", ".hpp")):
             new_content = replace_sse_headers(content)
             if new_content != content:
-                logger.info("Replaced SSE headers in %s", name)
+                logger.info("Pre-processed %s", name)
             updated[name] = new_content
         else:
             updated[name] = content
@@ -141,10 +139,10 @@ def create_workspace(source_dir: Path, snapshot: SourceSnapshot) -> WorkspaceSet
     root = Path(tempfile.mkdtemp(prefix="sse2rvv-"))
     workspace_dir = root / "workspace"
     shutil.copytree(source_dir, workspace_dir)
-    # Copy vendored Highway inside the workspace so -Ihighway works
-    hw_dest = workspace_dir / "highway"
-    if HIGHWAY_DIR.exists() and not hw_dest.exists():
-        shutil.copytree(HIGHWAY_DIR, hw_dest)
+    # Copy sse2rvv.h into the workspace so #include "sse2rvv.h" works
+    sse2rvv_dest = workspace_dir / "sse2rvv.h"
+    if SSE2RVV_HEADER.exists() and not sse2rvv_dest.exists():
+        shutil.copy2(SSE2RVV_HEADER, sse2rvv_dest)
     materialize_snapshot(workspace_dir, snapshot)
     logger.debug("Created workspace at %s", workspace_dir)
     return WorkspaceSet(root=root, workspace_dir=workspace_dir)
@@ -158,15 +156,6 @@ def apply_content_to_snapshot(
     updated = dict(snapshot.files)
     updated[file_name] = content
     return SourceSnapshot(files=updated)
-
-
-def apply_patch_to_snapshot(
-    snapshot: SourceSnapshot,
-    file_name: str,
-    patch: str,
-) -> SourceSnapshot:
-    updated_content = apply_patch(snapshot.files[file_name], patch, file_name)
-    return apply_content_to_snapshot(snapshot, file_name, updated_content)
 
 
 # ---------------------------------------------------------------------------
@@ -183,10 +172,10 @@ def write_output(output_dir: Path, snapshot: SourceSnapshot) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, content in snapshot.files.items():
         (output_dir / name).write_text(content)
-    # Copy vendored Highway so the output is standalone
-    hw_dest = output_dir / "highway"
-    if HIGHWAY_DIR.exists() and not hw_dest.exists():
-        shutil.copytree(HIGHWAY_DIR, hw_dest)
+    # Copy sse2rvv.h so the output is standalone
+    sse2rvv_dest = output_dir / "sse2rvv.h"
+    if SSE2RVV_HEADER.exists() and not sse2rvv_dest.exists():
+        shutil.copy2(SSE2RVV_HEADER, sse2rvv_dest)
     logger.info("Wrote %d file(s) to %s", len(snapshot.files), output_dir)
 
 
@@ -206,7 +195,7 @@ def _to_messages(raw: list[dict[str, str]]) -> list[Message]:
 
 def default_ssh_compile_command() -> str:
     """Default compile command for real RISC-V hardware via SSH."""
-    return "g++ -O2 -std=c++17 -I. -Ihighway -march=rv64gcv -mabi=lp64d *.c -o test_binary 2>&1"
+    return "g++ -O2 -std=c++17 -I. -march=rv64gcv -mabi=lp64d *.c -o test_binary 2>&1"
 
 
 def default_ssh_run_command() -> str:
@@ -215,13 +204,13 @@ def default_ssh_run_command() -> str:
 
 
 def default_build_command(target_file: str) -> str:
-    """Generate a default build + run command for Highway translation.
+    """Generate a default build + run command for sse2rvv translation.
 
     Compiles all C/C++ source files in the workspace, links them into a
     single binary, and runs it under QEMU.  Callers can override via
     --build-command.
     """
-    cflags = "-O2 -std=c++17 -I. -Ihighway -march=rv64gcv -mabi=lp64d"
+    cflags = "-O2 -std=c++17 -I. -march=rv64gcv -mabi=lp64d"
     return (
         f'echo "=== Compiling ===" && '
         f'{RISCVCXX} {cflags} *.c -o test_binary 2>&1 && '
@@ -237,7 +226,7 @@ def default_build_command(target_file: str) -> str:
 
 
 class TranslationAgent:
-    """LLM-driven SSE→Highway translation with compile-fix loop."""
+    """LLM-driven SSE→RISC-V translation with compile-fix loop using sse2rvv.h."""
 
     def __init__(self):
         self.docker_validator = DockerValidator()
@@ -292,19 +281,37 @@ class TranslationAgent:
                 truncate_for_log(response, 3000),
             )
 
-            # --- Extract diff ---
-            patch = extract_diff(response)
-            if patch is not None:
+            # --- Extract and apply search/replace blocks ---
+            candidate_snapshot = None
+            edit_error = None
+
+            sr_blocks = extract_search_replace(response)
+            if sr_blocks is not None:
                 logger.info(
-                    "Extracted patch (%d chars):\n%s",
-                    len(patch),
-                    truncate_for_log(patch, 2000),
+                    "Extracted %d search/replace block(s) from response",
+                    len(sr_blocks),
                 )
+                try:
+                    new_content = apply_search_replace(
+                        current_snapshot.files[file_name], sr_blocks,
+                    )
+                    candidate_snapshot = apply_content_to_snapshot(
+                        current_snapshot, file_name, new_content,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Search/replace failed on attempt %d: %s",
+                        attempt + 1, exc,
+                    )
+                    edit_error = str(exc)
 
-            if patch is None:
+            if candidate_snapshot is None:
+                error_msg = edit_error or (
+                    "Could not extract edits from the response. "
+                    "Use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks."
+                )
                 logger.warning(
-                    "Could not extract diff from LLM response on attempt %d",
-                    attempt + 1,
+                    "No valid edits on attempt %d: %s", attempt + 1, error_msg,
                 )
                 if attempt >= LLM_VALIDATION_RETRIES:
                     return None, latest_validation
@@ -312,34 +319,10 @@ class TranslationAgent:
                     {"role": "assistant", "content": response},
                     {
                         "role": "user",
-                        "content": build_diff_format_feedback(
+                        "content": build_edit_format_feedback(
                             file_name,
                             current_snapshot.files[file_name],
-                            "Could not extract a unified diff from the previous response.",
-                        ),
-                    },
-                ]
-                continue
-
-            # --- Apply diff ---
-            try:
-                candidate_snapshot = apply_patch_to_snapshot(
-                    current_snapshot, file_name, patch
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "Could not apply diff on attempt %d: %s", attempt + 1, exc
-                )
-                if attempt >= LLM_VALIDATION_RETRIES:
-                    return None, latest_validation
-                active_messages = active_messages + [
-                    {"role": "assistant", "content": response},
-                    {
-                        "role": "user",
-                        "content": build_diff_format_feedback(
-                            file_name,
-                            current_snapshot.files[file_name],
-                            str(exc),
+                            error_msg,
                         ),
                     },
                 ]
@@ -593,7 +576,7 @@ class TranslationAgent:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Translate SSE C/C++ code to RISC-V using Google Highway"
+        description="Translate SSE C/C++ code to RISC-V using sse2rvv.h"
     )
     parser.add_argument(
         "source_dir",

@@ -86,8 +86,8 @@ All settings are in `src/config.py` and overridable via environment variables. S
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_BASE_URL` | `http://localhost:30000/v1` | OpenAI-compatible LLM endpoint |
-| `OPENROUTER_API_KEY` | *(empty)* | Fallback API key for OpenRouter |
+| `OPENROUTER_API_KEY` | *(required)* | API key for OpenRouter |
+| `OPENROUTER_MODEL` | `openai/gpt-oss-120b` | Model to use via OpenRouter |
 | `DOCKER_IMAGE` | `luispimo/riscv-toolchain:arm64-2025-10-20` | RISC-V cross-compilation image |
 | `RISCVCXX` | `riscv64-unknown-elf-g++` | RISC-V C++ compiler |
 | `SSH_HOST` | `final` | SSH host for real hardware validation |
@@ -100,16 +100,15 @@ All settings are in `src/config.py` and overridable via environment variables. S
 riscv-translator/
 ├── src/                    Python package (translation pipeline)
 │   ├── repair.py           TranslationAgent — LLM compile-fix loop
-│   ├── prompts.py          Generic SSE→Highway translation prompts
+│   ├── prompts.py          Generic SSE→sse2rvv.h translation prompts
 │   ├── validators.py       DockerValidator (QEMU) + SSHValidator
-│   ├── diff_utils.py       Robust unified-diff parser
-│   ├── llm_utils.py        LLM client with fallback chain
+│   ├── diff_utils.py       Robust search/replace parser
+│   ├── llm_utils.py        LLM client (OpenRouter)
 │   ├── llm_types.py        Message/LLM protocol types
 │   ├── config.py           Configuration (env-var overridable)
 │   └── logger.py           Terminal logger
 ├── tests/                  Test suite
-├── initial_code/           Example: SSW library (SSE2 source)
-├── highway/                Vendored Google Highway library
+├── initial_code/           Example: SSW library (SSE2 source) + sse2rvv.h
 ├── docs/                   RVV reference material for LLM context
 ├── Makefile                Top-level build targets
 ├── pyproject.toml          Python packaging (uv)
