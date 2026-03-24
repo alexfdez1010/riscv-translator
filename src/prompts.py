@@ -6,7 +6,7 @@ compiler errors based on feedback — without any hardcoded, library-specific fi
 """
 
 from src.config import REFERENCE_FILE, RVV_REFERENCE
-from src.diff_utils import search_replace_error_feedback, search_replace_format_example
+from src.search_replace import search_replace_error_feedback, search_replace_format_example
 from src.logger import get_logger
 
 logger = get_logger(__name__)
@@ -91,9 +91,8 @@ replacement lines
   (same indentation, same whitespace, character for character).
 - The REPLACE section must be DIFFERENT from SEARCH — every block must
   actually change something.  Never emit a block where search == replace.
-- Each SEARCH text must appear exactly once in the file.  If the same
-  lines appear in multiple places, include more surrounding context lines
-  to make the SEARCH unique.
+- If the same text appears in multiple places and you want to change ALL
+  of them, a single block is enough — all occurrences will be replaced.
 - You may use multiple search/replace blocks for changes in different
   parts of the file.
 - Do NOT modify unrelated code.

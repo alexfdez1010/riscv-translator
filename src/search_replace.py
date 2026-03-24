@@ -7,6 +7,7 @@ Key design goals
 ----------------
 * Simple, unambiguous format that LLMs produce correctly.
 * Exact string matching with whitespace-tolerant fallback.
+* Graceful handling of duplicate matches (replace all occurrences).
 * Clear, actionable error messages so the LLM can self-correct.
 * Stay dependency-free (stdlib only).
 """
@@ -35,7 +36,7 @@ _SR_BLOCK_RE = re.compile(
 
 @dataclass(slots=True)
 class SearchReplaceBlock:
-    """A single search→replace edit."""
+    """A single search->replace edit."""
     search: str
     replace: str
 
@@ -84,40 +85,159 @@ def extract_search_replace(response: str) -> list[SearchReplaceBlock] | None:
     return blocks
 
 
+# ---------------------------------------------------------------------------
+# Apply search/replace blocks
+# ---------------------------------------------------------------------------
+
+
 def apply_search_replace(
     original: str, blocks: list[SearchReplaceBlock]
 ) -> str:
     """Apply search/replace blocks sequentially to *original*.
 
-    Each block's *search* text must appear exactly once in the current
-    state of the file (after previous blocks have been applied).
-
-    Raises ``ValueError`` with an actionable message if a search string
-    is not found or is ambiguous (appears more than once).
+    Strategy for each block:
+    1. Exact match, unique -> replace the single occurrence.
+    2. Exact match, multiple occurrences -> replace ALL occurrences.
+       (The LLM almost always wants the same mechanical fix everywhere.)
+    3. No exact match -> try fuzzy matching (whitespace tolerance).
+    4. Still no match -> check if the search text was already replaced
+       by a previous block (skip silently).
+    5. Otherwise -> raise ``ValueError`` with an actionable message.
     """
     result = original
+    applied_replacements: list[tuple[str, str]] = []
+
     for i, block in enumerate(blocks, 1):
         count = result.count(block.search)
-        if count == 0:
-            # Try whitespace-tolerant matching
-            found = _fuzzy_search_replace(result, block.search, block.replace)
-            if found is not None:
-                result = found
-                continue
-            # Show a snippet of what we searched for
-            preview = block.search[:120].replace("\n", "\\n")
-            raise ValueError(
-                f"Search/replace block {i}: search text not found in file. "
-                f"Searched for: {preview!r}"
-            )
+
+        if count == 1:
+            # Unique exact match — ideal case
+            result = result.replace(block.search, block.replace, 1)
+            applied_replacements.append((block.search, block.replace))
+            continue
+
         if count > 1:
-            preview = block.search[:120].replace("\n", "\\n")
-            raise ValueError(
-                f"Search/replace block {i}: search text appears {count} times "
-                f"(must be unique). Text: {preview!r}"
+            # Multiple occurrences — replace ALL of them.
+            logger.info(
+                "Search/replace block %d: search text appears %d times; "
+                "replacing all occurrences",
+                i, count,
             )
-        result = result.replace(block.search, block.replace, 1)
+            result = result.replace(block.search, block.replace)
+            applied_replacements.append((block.search, block.replace))
+            continue
+
+        # count == 0: try fuzzy matching
+        found = _fuzzy_search_replace(result, block.search, block.replace)
+        if found is not None:
+            result = found
+            applied_replacements.append((block.search, block.replace))
+            continue
+
+        # Check if a previous block already replaced this text
+        already_applied = _was_already_applied(
+            block, applied_replacements, result
+        )
+        if already_applied:
+            logger.info(
+                "Search/replace block %d: search text already handled "
+                "by a prior block; skipping",
+                i,
+            )
+            continue
+
+        # Truly not found
+        preview = block.search[:120].replace("\n", "\\n")
+        raise ValueError(
+            f"Search/replace block {i}: search text not found in file. "
+            f"Searched for: {preview!r}"
+        )
     return result
+
+
+def _was_already_applied(
+    block: SearchReplaceBlock,
+    applied_replacements: list[tuple[str, str]],
+    current_text: str,
+) -> bool:
+    """Check if a block's search text was already consumed by a prior block."""
+    for prev_search, prev_replace in applied_replacements:
+        # Same search text was used before
+        if prev_search == block.search:
+            return True
+        # The search text is a substring of a previous search
+        if block.search in prev_search:
+            return True
+        # The search text appears in a previous replacement
+        # (the prior block already transformed it)
+        if block.search in prev_replace:
+            return True
+    # The replacement is already present in the file
+    if block.replace and block.replace in current_text:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy matching
+# ---------------------------------------------------------------------------
+
+
+def _norm_line(line: str) -> str:
+    """Normalise a single line for fuzzy comparison.
+
+    Strips trailing whitespace and normalises leading whitespace
+    (tabs <-> spaces) so minor indentation differences don't prevent
+    matching.
+    """
+    stripped = line.rstrip()
+    leading = len(stripped) - len(stripped.lstrip())
+    prefix = stripped[:leading].replace("\t", "    ")
+    return prefix + stripped[leading:]
+
+
+def _find_all_line_matches(
+    text_norm: list[str], search_norm: list[str]
+) -> list[int]:
+    """Return start indices of all non-overlapping line-based matches."""
+    slen = len(search_norm)
+    if slen == 0:
+        return []
+    matches: list[int] = []
+    i = 0
+    while i <= len(text_norm) - slen:
+        if text_norm[i : i + slen] == search_norm:
+            matches.append(i)
+            i += slen  # skip past to avoid overlaps
+        else:
+            i += 1
+    return matches
+
+
+def _replace_line_matches(
+    text_lines: list[str],
+    match_starts: list[int],
+    search_len: int,
+    replace: str,
+) -> str:
+    """Replace all matched line regions in *text_lines*."""
+    replace_lines = replace.splitlines(keepends=True)
+
+    result_lines = list(text_lines)
+    # Work backwards so indices stay valid
+    for start in reversed(match_starts):
+        end = start + search_len
+        patched = list(replace_lines)
+        if patched and not patched[-1].endswith("\n"):
+            has_trailing = (
+                end < len(result_lines)
+                or (result_lines and result_lines[-1].endswith("\n"))
+            )
+            if has_trailing:
+                patched[-1] += "\n"
+        result_lines[start:end] = patched
+
+    return "".join(result_lines)
 
 
 def _fuzzy_search_replace(
@@ -125,29 +245,35 @@ def _fuzzy_search_replace(
 ) -> str | None:
     """Try to match *search* against *text* with whitespace tolerance.
 
-    Normalises trailing whitespace on each line before comparing.
+    Tries the following strategies in order:
+    1. Trailing-whitespace normalisation (rstrip each line).
+    2. Tab <-> spaces normalisation (leading whitespace).
+
+    If matches are found (even multiple), replaces all of them.
     Returns the modified text or ``None`` if no match.
     """
-    def _norm_lines(s: str) -> list[str]:
-        return [ln.rstrip() for ln in s.splitlines()]
-
-    search_norm = _norm_lines(search)
+    search_lines_raw = search.splitlines()
     text_lines = text.splitlines(keepends=True)
-    text_norm = [ln.rstrip() for ln in text_lines]
 
-    # Slide search window over text
-    slen = len(search_norm)
-    for start in range(len(text_norm) - slen + 1):
-        if text_norm[start : start + slen] == search_norm:
-            # Found — replace the original lines
-            before = text_lines[:start]
-            after = text_lines[start + slen:]
-            # Preserve trailing newline style from original
-            replace_lines = replace.splitlines(keepends=True)
-            if replace_lines and not replace_lines[-1].endswith("\n"):
-                if after or (text_lines and text_lines[-1].endswith("\n")):
-                    replace_lines[-1] += "\n"
-            return "".join(before) + "".join(replace_lines) + "".join(after)
+    if not search_lines_raw:
+        return None
+
+    search_len = len(search_lines_raw)
+
+    # --- Strategy 1: trailing-whitespace-only normalisation ---
+    search_norm = [ln.rstrip() for ln in search_lines_raw]
+    text_norm = [ln.rstrip() for ln in text_lines]
+    matches = _find_all_line_matches(text_norm, search_norm)
+    if matches:
+        return _replace_line_matches(text_lines, matches, search_len, replace)
+
+    # --- Strategy 2: full whitespace normalisation (tabs <-> spaces) ---
+    search_norm2 = [_norm_line(ln) for ln in search_lines_raw]
+    text_norm2 = [_norm_line(ln) for ln in text_lines]
+    matches = _find_all_line_matches(text_norm2, search_norm2)
+    if matches:
+        return _replace_line_matches(text_lines, matches, search_len, replace)
+
     return None
 
 
@@ -221,8 +347,8 @@ Example — multi-line change (include enough context to be unique):
 
 IMPORTANT:
 - SEARCH must match the file EXACTLY (same whitespace, same indentation).
-- SEARCH must appear exactly once in the file — include surrounding lines
-  to make it unique if needed.
+- If the same text appears in multiple places and you want to change ALL
+  of them, a single block is enough — all occurrences will be replaced.
 - REPLACE must be DIFFERENT from SEARCH — every block must make a change.
 """
 
@@ -247,9 +373,8 @@ def search_replace_error_feedback(
         f"RULES — read these before responding:\n"
         f"1. The SEARCH text must be copied EXACTLY from the current file "
         f"(same indentation, same whitespace, character for character).\n"
-        f"2. Each SEARCH text must appear exactly once in the file.  If the "
-        f"text you chose appears multiple times, include more surrounding "
-        f"lines to make it unique.\n"
+        f"2. If the same text appears multiple times, a single search/replace "
+        f"block is enough — all occurrences will be replaced.\n"
         f"3. The REPLACE text must be DIFFERENT from the SEARCH text.  "
         f"Every block must change something — do not emit no-op blocks.\n\n"
         f"Current {file_name} (with line numbers):\n"

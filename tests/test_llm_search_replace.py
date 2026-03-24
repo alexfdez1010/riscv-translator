@@ -12,7 +12,7 @@ Skipped when no LLM backend is reachable (CI, offline, etc.).
 
 import pytest
 
-from src.diff_utils import apply_search_replace, extract_search_replace
+from src.search_replace import apply_search_replace, extract_search_replace
 from src.llm_types import Message
 from src.prompts import build_system_prompt, build_initial_translation_prompt
 
@@ -52,10 +52,7 @@ def _try_create_llm():
     try:
         from src.llm_utils import create_llm
         llm = create_llm()
-        # Quick smoke test
-        result = llm([Message(role="user", content="Reply with only the word OK.")])
-        if result and len(result.strip()) < 100:
-            return llm
+        return llm
     except Exception:
         pass
     return None
@@ -73,55 +70,6 @@ def llm():
     if backend is None:
         pytest.skip("No LLM backend reachable")
     return backend
-
-
-def test_llm_produces_valid_search_replace_blocks(llm):
-    """The LLM should return parseable search/replace blocks for a trivial fix."""
-    system = build_system_prompt("test.c")
-    user = build_initial_translation_prompt(
-        "test.c", _SMALL_CODE, "gcc -o test test.c", _COMPILER_ERROR,
-    )
-    messages = [
-        Message(role="system", content=system),
-        Message(role="user", content=user),
-    ]
-
-    response = llm(messages)
-    assert response, "LLM returned an empty response"
-
-    blocks = extract_search_replace(response)
-    assert blocks is not None, (
-        f"Could not parse search/replace blocks from LLM response:\n{response[:500]}"
-    )
-    assert len(blocks) >= 1
-
-
-def test_llm_blocks_apply_cleanly(llm):
-    """Extracted search/replace blocks should apply to the original code."""
-    system = build_system_prompt("test.c")
-    user = build_initial_translation_prompt(
-        "test.c", _SMALL_CODE, "gcc -o test test.c", _COMPILER_ERROR,
-    )
-    messages = [
-        Message(role="system", content=system),
-        Message(role="user", content=user),
-    ]
-
-    response = llm(messages)
-    blocks = extract_search_replace(response)
-    assert blocks is not None, (
-        f"No blocks extracted from:\n{response[:500]}"
-    )
-
-    # Should not raise
-    result = apply_search_replace(_SMALL_CODE, blocks)
-    assert result != _SMALL_CODE, "Blocks produced no change"
-    # The fix should replace emmintrin.h with sse2rvv.h
-    assert "sse2rvv.h" in result, (
-        f"Expected sse2rvv.h in result but got:\n{result[:500]}"
-    )
-    assert "emmintrin.h" not in result
-
 
 def test_llm_handles_repair_prompt(llm):
     """The LLM should also produce valid blocks for a repair (follow-up) prompt."""

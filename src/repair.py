@@ -32,7 +32,7 @@ from src.config import (
     RISCVCXX,
     SIMULATOR,
 )
-from src.diff_utils import apply_search_replace, extract_search_replace
+from src.search_replace import apply_search_replace, extract_search_replace
 from src.llm_utils import create_llm
 from src.logger import configure_logging, get_logger
 from src.prompts import (

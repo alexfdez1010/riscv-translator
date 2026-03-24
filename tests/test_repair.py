@@ -4,7 +4,7 @@ import pytest
 
 from src import repair
 from src.config import REFERENCE_FILE
-from src.diff_utils import search_replace_error_feedback
+from src.search_replace import search_replace_error_feedback
 from src.prompts import (
     build_initial_translation_prompt,
     build_repair_prompt,

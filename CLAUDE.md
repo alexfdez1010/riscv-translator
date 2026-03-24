@@ -69,14 +69,14 @@ uv run python -m src.repair <source_dir> <target_file> <output_dir> \
 - **Config**: `src/config.py` — all tunables, overridable via environment variables (see `.env.example`).
 - **Validators**: `src/validators.py` — `DockerValidator` (QEMU emulation) and `SSHValidator` (real hardware).
 - **Prompts**: `src/prompts.py` — generic SSE→sse2rvv.h translation prompts (no library-specific hardcoding).
-- **Diff utils**: `src/diff_utils.py` — robust unified-diff parsing tolerant of LLM formatting mistakes.
+- **Search/replace**: `src/search_replace.py` — robust search/replace block parsing and application tolerant of LLM formatting mistakes.
 - **Reference material**: `docs/riscv-reference/reference.md` is the authoritative RVV reference for LLM prompts.
 
 ## Testing
 
 ```bash
 uv run pytest tests/ -v --tb=short        # full suite
-uv run pytest tests/test_diff_utils.py -q  # diff parser tests
+uv run pytest tests/test_search_replace.py -q  # search/replace tests
 uv run pytest tests/test_repair.py -q      # translation pipeline tests
 ```
 
