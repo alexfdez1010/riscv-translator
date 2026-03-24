@@ -46,9 +46,22 @@ size depends on the hardware vector length (VLEN).  The compiler will reject
 **Do NOT hardcode `16` or any fixed byte size.**  The code must work on
 hardware with any VLEN (128, 256, 512, …).
 
-sse2rvv.h provides a runtime helper:
+### Step 1: Add a runtime size helper
 
-    SSE2RVV_VTYPE_SIZE   — returns the byte size of one vector register
+sse2rvv.h does NOT provide this helper — you must add it to the translated
+source file (near the top, after the `#include "sse2rvv.h"` line):
+
+```c
+/* Runtime size (in bytes) of one RVV vector register (LMUL=1). */
+static inline size_t __sse2rvv_vtype_size(void) {{
+    size_t vlenb;
+    __asm__ __volatile__("csrr %0, vlenb" : "=r"(vlenb));
+    return vlenb;
+}}
+#define SSE2RVV_VTYPE_SIZE __sse2rvv_vtype_size()
+```
+
+### Step 2: Use SSE2RVV_VTYPE_SIZE everywhere
 
 Use it as a drop-in replacement for `sizeof(__m128i)`:
 
