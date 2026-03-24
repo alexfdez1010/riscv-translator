@@ -1,17 +1,30 @@
 # RISC-V Translator
 
-LLM-driven pipeline for translating C/C++ libraries that use x86 SSE/SSE2 SIMD intrinsics to RISC-V Vector (RVV) extensions via [Google Highway](https://github.com/google/highway).
+LLM-driven pipeline for translating C/C++ libraries that use x86 SSE/SSE2 SIMD intrinsics to RISC-V Vector (RVV) extensions using the [sse2rvv](https://github.com/pattonkan/sse2rvv) drop-in compatibility header.
 
-## Overview
+## What This Does
 
-The pipeline is **generic** — it works with any SSE-based codebase, not just a specific library. The LLM iteratively fixes compiler errors based on feedback until the translated code compiles and runs correctly.
+This tool takes C/C++ code written with x86 SSE/SSE2 intrinsics and automatically translates it to run on RISC-V hardware. An LLM reads compiler errors, produces minimal source patches, and repeats until the code compiles and runs correctly — no manual porting required.
+
+The translation relies on **[sse2rvv](https://github.com/pattonkan/sse2rvv)**, a header-only library that re-implements SSE/SSE2 intrinsics using RISC-V Vector (RVV) instructions. We include a **subset** of `sse2rvv.h` in this repository — only the intrinsics needed for our current use case — rather than the full upstream header.
+
+### Current Test Case
+
+The library we translated is the **[Complete-Striped-Smith-Waterman-Library (SSW)](https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library)**, a SIMD-accelerated implementation of the Smith-Waterman algorithm for sequence alignment. The pipeline is generic though — it works with any SSE-based codebase, not just SSW.
+
+## How It Works
 
 ```
 SSE source code (input directory)
         |
         v
 +---------------------+
-|  LLM Translation    |  SSE intrinsics -> Google Highway C++
+|  Pre-processing      |  Replace SSE #includes with sse2rvv.h
++---------------------+
+        |
+        v
++---------------------+
+|  LLM Translation    |  SSE intrinsics → sse2rvv.h equivalents
 |  & Repair Loop      |  Incremental diffs guided by compiler feedback
 |  (src/repair.py)    |
 +---------------------+
@@ -29,8 +42,15 @@ SSE source code (input directory)
 +---------------------+
         |
         v
-  Translated output file (Highway C++)
+  Translated output file
 ```
+
+1. **Input**: A directory of C/C++ source files using SSE intrinsics.
+2. **Pre-processing**: SSE `#include` directives are replaced with `#include "sse2rvv.h"`.
+3. **Compile-fix loop**: The code is compiled in Docker with the RISC-V toolchain + QEMU emulator. Compiler errors are fed back to the LLM, which produces minimal diffs until compilation succeeds.
+4. **Simulator validation**: The binary runs under QEMU to verify correctness.
+5. **Hardware validation** *(optional)*: If SSH to real RISC-V hardware is available, the code is also compiled and run there.
+6. **Output**: The final translated source files.
 
 ## Quick Start
 
@@ -63,11 +83,8 @@ uv run python -m src.repair <source_dir> <target_file> <output_dir> \
 uv run python -m src.repair initial_code ssw.c output/
 ```
 
-On success, the `output/` directory will contain all files needed to compile
-and run the translated program (source files + vendored Highway library).
-
 The pipeline will:
-1. Use an LLM to translate SSE intrinsics to Google Highway equivalents
+1. Use an LLM to translate SSE intrinsics to sse2rvv.h equivalents
 2. Validate each patch via Docker + QEMU emulation
 3. Feed compiler errors back to the LLM for incremental fixes
 4. Optionally validate on real RISC-V hardware via SSH
@@ -102,20 +119,29 @@ riscv-translator/
 │   ├── repair.py           TranslationAgent — LLM compile-fix loop
 │   ├── prompts.py          Generic SSE→sse2rvv.h translation prompts
 │   ├── validators.py       DockerValidator (QEMU) + SSHValidator
-│   ├── diff_utils.py       Robust search/replace parser
+│   ├── search_replace.py   Robust search/replace parser
 │   ├── llm_utils.py        LLM client (OpenRouter)
 │   ├── llm_types.py        Message/LLM protocol types
 │   ├── config.py           Configuration (env-var overridable)
 │   └── logger.py           Terminal logger
+├── initial_code/           SSW library source (SSE2) + sse2rvv.h subset
 ├── tests/                  Test suite
-├── initial_code/           Example: SSW library (SSE2 source) + sse2rvv.h
+├── dataset/                FASTA test data (for SSW example)
 ├── docs/                   RVV reference material for LLM context
 ├── Makefile                Top-level build targets
 ├── pyproject.toml          Python packaging (uv)
 └── .env.example            Environment variables template
 ```
 
+## Key Dependencies
+
+- **[sse2rvv](https://github.com/pattonkan/sse2rvv)** — Header-only SSE-to-RVV translation layer. We include only the subset of intrinsics required by the current target library.
+- **[Complete-Striped-Smith-Waterman-Library](https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library)** — The C library we translated as the first test case.
+
 ## License
 
-The SSW library is MIT/BSD licensed (see source file headers).
-The Highway library is Apache-2.0 licensed.
+This project is licensed under the [MIT License](LICENSE).
+
+The bundled third-party components are also MIT-compatible:
+- **SSW library** — MIT License (see `initial_code/ssw.c` header)
+- **sse2rvv** — MIT License (see [upstream](https://github.com/pattonkan/sse2rvv))
