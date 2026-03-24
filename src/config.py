@@ -18,6 +18,8 @@ REFERENCE_FILE = PROJECT_DIR / "docs" / "riscv-reference" / "reference.md"
 
 SSH_HOST = os.getenv("SSH_HOST", "final")
 REMOTE_DIR = os.getenv("REMOTE_DIR", "/tmp/sse2rvv")
+SSH_CC = os.getenv("SSH_CC", "clang")
+SSH_CXX = os.getenv("SSH_CXX", "clang++")
 
 # ---------------------------------------------------------------------------
 # LLM (OpenRouter)

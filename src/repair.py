@@ -31,6 +31,8 @@ from src.config import (
     REACT_MAX_STEPS,
     RISCVCXX,
     SIMULATOR,
+    SSH_CC,
+    SSH_CXX,
 )
 from src.search_replace import apply_search_replace, extract_search_replace
 from src.llm_utils import create_llm
@@ -195,7 +197,7 @@ def _to_messages(raw: list[dict[str, str]]) -> list[Message]:
 
 def default_ssh_compile_command() -> str:
     """Default compile command for real RISC-V hardware via SSH."""
-    return "g++ -O2 -std=c++17 -I. -march=rv64gcv -mabi=lp64d *.c -o test_binary 2>&1"
+    return f"{SSH_CC} -o test_binary *.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. 2>&1"
 
 
 def default_ssh_run_command() -> str:
