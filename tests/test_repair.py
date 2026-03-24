@@ -57,7 +57,7 @@ def _patch_infra(monkeypatch, tmp_path, *, docker_ok=False):
     monkeypatch.setattr(
         repair,
         "create_workspace",
-        lambda source_dir, snapshot: repair.WorkspaceSet(tmp_path / "root", tmp_path),
+        lambda source_dir, snapshot, test_data_dir=None: repair.WorkspaceSet(tmp_path / "root", tmp_path),
     )
     monkeypatch.setattr(repair.shutil, "rmtree", lambda *a, **kw: None)
     monkeypatch.setattr(
@@ -340,6 +340,9 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
 
 def test_default_build_command_generates_compile_command():
     cmd = repair.default_build_command("ssw.c")
-    assert "*.c" in cmd
-    assert "-std=c++17" in cmd
+    assert "main.c ssw.c" in cmd
+    assert "ssw_test" in cmd
+    assert "-lm -lz" in cmd
+    assert "demo/10M.fa" in cmd
+    assert "Building zlib" in cmd
     assert "Compilation succeeded" in cmd

@@ -99,12 +99,14 @@ class DockerValidator:
                 timeout=VALIDATION_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
+            raw_out = getattr(exc, "stdout", b"") or b""
+            raw_err = getattr(exc, "stderr", b"") or b""
             return ValidationResult(
                 ok=False,
                 stage="timeout",
                 returncode=None,
-                stdout=getattr(exc, "stdout", "") or "",
-                stderr=getattr(exc, "stderr", "") or "Docker validation timed out.",
+                stdout=raw_out.decode(errors="replace") if isinstance(raw_out, bytes) else raw_out,
+                stderr=raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else raw_err or "Docker validation timed out.",
             )
         except Exception as exc:
             logger.warning("Docker validation execution failed: %s", exc)
@@ -278,12 +280,14 @@ class SSHValidator:
             )
 
         except subprocess.TimeoutExpired as exc:
+            raw_out = getattr(exc, "stdout", b"") or b""
+            raw_err = getattr(exc, "stderr", b"") or b""
             return ValidationResult(
                 ok=False,
                 stage="ssh-timeout",
                 returncode=None,
-                stdout=getattr(exc, "stdout", "") or "",
-                stderr=getattr(exc, "stderr", "") or "SSH validation timed out.",
+                stdout=raw_out.decode(errors="replace") if isinstance(raw_out, bytes) else raw_out,
+                stderr=raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else raw_err or "SSH validation timed out.",
             )
         except Exception as exc:
             logger.warning("SSH validation error: %s", exc)

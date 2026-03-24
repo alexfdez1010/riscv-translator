@@ -30,3 +30,6 @@ output
 
 .pytest_cache
 experiment.txt
+.claude
+
+ssw_test

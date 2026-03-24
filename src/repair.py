@@ -26,10 +26,11 @@ from pathlib import Path
 
 from src.llm_types import LLM, Message
 from src.config import (
+    DATASETS_DIR,
     LLM_VALIDATION_RETRIES,
     PROJECT_DIR,
     REACT_MAX_STEPS,
-    RISCVCXX,
+    RISCVCC,
     SIMULATOR,
     SSH_CC,
     SSH_CXX,
@@ -136,7 +137,11 @@ def materialize_snapshot(workspace_dir: Path, snapshot: SourceSnapshot) -> None:
         (workspace_dir / name).write_text(content)
 
 
-def create_workspace(source_dir: Path, snapshot: SourceSnapshot) -> WorkspaceSet:
+def create_workspace(
+    source_dir: Path,
+    snapshot: SourceSnapshot,
+    test_data_dir: Path | None = None,
+) -> WorkspaceSet:
     """Create a temporary workspace by copying the source directory."""
     root = Path(tempfile.mkdtemp(prefix="sse2rvv-"))
     workspace_dir = root / "workspace"
@@ -145,6 +150,11 @@ def create_workspace(source_dir: Path, snapshot: SourceSnapshot) -> WorkspaceSet
     sse2rvv_dest = workspace_dir / "sse2rvv.h"
     if SSE2RVV_HEADER.exists() and not sse2rvv_dest.exists():
         shutil.copy2(SSE2RVV_HEADER, sse2rvv_dest)
+    # Copy test data into demo/ subdirectory if provided
+    if test_data_dir is not None and test_data_dir.is_dir():
+        demo_dir = workspace_dir / "demo"
+        shutil.copytree(test_data_dir, demo_dir)
+        logger.debug("Copied test data from %s to %s", test_data_dir, demo_dir)
     materialize_snapshot(workspace_dir, snapshot)
     logger.debug("Created workspace at %s", workspace_dir)
     return WorkspaceSet(root=root, workspace_dir=workspace_dir)
@@ -197,27 +207,45 @@ def _to_messages(raw: list[dict[str, str]]) -> list[Message]:
 
 def default_ssh_compile_command() -> str:
     """Default compile command for real RISC-V hardware via SSH."""
-    return f"{SSH_CC} -o test_binary *.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. 2>&1"
+    return f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm -lz 2>&1"
 
 
 def default_ssh_run_command() -> str:
     """Default run command for real RISC-V hardware via SSH."""
-    return "./test_binary 2>&1"
+    return "./ssw_test demo/10M.fa demo/54mer_hap1_1.100.fa 2>&1"
+
+
+def _build_zlib_command() -> str:
+    """Shell snippet to cross-compile zlib for RISC-V from sources in the Docker image."""
+    return (
+        'ZLIB_SRC=/home/riscv_srcs/riscv-gnu-toolchain/gcc/zlib && '
+        f'cd $ZLIB_SRC && CC={RISCVCC} CFLAGS="-march=rv64gcv -mabi=lp64d -O2" '
+        './configure --host=riscv64-unknown-elf --prefix=/tmp/zlib-rv >/dev/null 2>&1 && '
+        'make -j$(nproc) >/dev/null 2>&1 && '
+        'mkdir -p /tmp/zlib-rv/include /tmp/zlib-rv/lib && '
+        'cp $ZLIB_SRC/zlib.h $ZLIB_SRC/zconf.h /tmp/zlib-rv/include/ && '
+        'cp $ZLIB_SRC/libz.a /tmp/zlib-rv/lib/ && '
+        'cd /workspace'
+    )
 
 
 def default_build_command(target_file: str) -> str:
     """Generate a default build + run command for sse2rvv translation.
 
-    Compiles all C/C++ source files in the workspace, links them into a
-    single binary, and runs it under QEMU.  Callers can override via
+    Cross-compiles zlib for RISC-V (from sources in the Docker image), then
+    compiles main.c and ssw.c into ssw_test, links with -lm -lz, and
+    runs it under QEMU with the demo datasets.  Callers can override via
     --build-command.
     """
-    cflags = "-O2 -std=c++17 -I. -march=rv64gcv -mabi=lp64d"
+    cflags = "-O2 -I. -I/tmp/zlib-rv/include -march=rv64gcv -mabi=lp64d"
+    ldflags = "-L/tmp/zlib-rv/lib -lm -lz"
     return (
+        f'echo "=== Building zlib for RISC-V ===" && '
+        f'{_build_zlib_command()} && '
         f'echo "=== Compiling ===" && '
-        f'{RISCVCXX} {cflags} *.c -o test_binary 2>&1 && '
+        f'{RISCVCC} {cflags} main.c ssw.c -o ssw_test {ldflags} 2>&1 && '
         f'echo "=== Compilation succeeded, running under QEMU ===" && '
-        f'{SIMULATOR} ./test_binary 2>&1 && '
+        f'{SIMULATOR} ./ssw_test demo/10M.fa demo/54mer_hap1_1.100.fa 2>&1 && '
         f'echo "=== Execution succeeded ==="'
     )
 
@@ -385,6 +413,7 @@ class TranslationAgent:
         ssh_compile_command: str | None = None,
         ssh_run_command: str | None = None,
         max_steps: int = REACT_MAX_STEPS,
+        test_data_dir: Path | None = None,
     ) -> int:
         """Run the full translation pipeline.
 
@@ -396,6 +425,7 @@ class TranslationAgent:
             ssh_compile_command: Shell command to compile on SSH hardware. Skipped if None.
             ssh_run_command: Shell command to run on SSH hardware. Skipped if None.
             max_steps: Maximum LLM repair iterations.
+            test_data_dir: Directory with test data files; copied into workspace as demo/.
         """
         if build_command is None:
             build_command = default_build_command(target_file)
@@ -422,7 +452,7 @@ class TranslationAgent:
         # --- Pre-processing: replace SSE headers with Highway includes ---
         snapshot = preprocess_snapshot(snapshot)
 
-        workspaces = create_workspace(source_dir, snapshot)
+        workspaces = create_workspace(source_dir, snapshot, test_data_dir)
 
         try:
             # --- Baseline validation ---
@@ -616,6 +646,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=REACT_MAX_STEPS,
     )
+    parser.add_argument(
+        "--test-data",
+        type=Path,
+        default=DATASETS_DIR,
+        help="Directory with test data files; copied into workspace as demo/",
+    )
     return parser.parse_args()
 
 
@@ -630,6 +666,7 @@ def main() -> int:
         ssh_compile_command=args.ssh_compile,
         ssh_run_command=args.ssh_run,
         max_steps=args.max_steps,
+        test_data_dir=args.test_data,
     )
 
 
