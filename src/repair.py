@@ -450,8 +450,9 @@ class TranslationAgent:
                         return 0
                     logger.warning(
                         "Baseline passes QEMU but fails SSH at stage %s; "
-                        "proceeding with repair",
+                        "proceeding with repair\n%s",
                         ssh_result.stage,
+                        ssh_result.combined_output,
                     )
                     baseline = ValidationResult(
                         ok=False,
@@ -534,9 +535,10 @@ class TranslationAgent:
                             )
                             return 0
                         logger.warning(
-                            "Step %d passed QEMU but failed SSH at stage %s",
+                            "Step %d passed QEMU but failed SSH at stage %s\n%s",
                             step,
                             ssh_result.stage,
+                            ssh_result.combined_output,
                         )
                         latest_validation = ValidationResult(
                             ok=False,
