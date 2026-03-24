@@ -132,7 +132,7 @@ Context:
 - Build & validation command: {build_command}
 
 What to change:
-- Replace x86 SSE headers with `#include "sse2rvv.h"`.
+- SSE headers have already been replaced with `#include "sse2rvv.h"` automatically.
 - Fix compiler errors shown in the validation feedback below.
 - Keep changes minimal and localised — sse2rvv.h provides all SSE intrinsics.
 
