@@ -342,7 +342,55 @@ def test_default_build_command_generates_compile_command():
     cmd = repair.default_build_command("ssw.c")
     assert "main.c ssw.c" in cmd
     assert "ssw_test" in cmd
-    assert "-lm -lz" in cmd
+    assert "-lm" in cmd
     assert "demo/10k.fa" in cmd
-    assert "Building zlib" in cmd
     assert "Compilation succeeded" in cmd
+
+
+# ---------------------------------------------------------------------------
+# Intel (jump host) original code integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _unmock_ssh(monkeypatch):
+    """Remove the autouse SSH mock so we can use a real SSH connection."""
+    monkeypatch.undo()
+
+
+@pytest.mark.usefixtures("_unmock_ssh")
+def test_original_code_compiles_and_runs_on_intel():
+    """Upload original source to the jump host, compile with gcc, run with a small dataset."""
+    from pathlib import Path
+
+    from src.benchmark import (
+        REFERENCE_FILE as BENCH_REFERENCE_FILE,
+        check_ssh,
+        run_on_host,
+        upload_datasets,
+        upload_to_host,
+    )
+    from src.config import DATASETS_DIR, PROJECT_DIR, SSH_JUMP_HOST
+
+    jump_host = SSH_JUMP_HOST
+    if not check_ssh(jump_host):
+        pytest.skip(f"Jump host {jump_host} not reachable")
+
+    source_dir = PROJECT_DIR / "initial_code"
+    dataset_dir = DATASETS_DIR
+    dataset = "1k.fa"
+    remote_dir = "/tmp/sse2rvv-test-intel"
+
+    # Upload source files
+    source_files = [p for p in source_dir.iterdir() if p.is_file()]
+    assert upload_to_host(jump_host, remote_dir, source_files), "Failed to upload source files"
+    assert upload_datasets(jump_host, remote_dir, dataset_dir, dataset), "Failed to upload datasets"
+
+    # Compile and run
+    compile_cmd = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
+    run_cmd = f"./ssw_test demo/{dataset} demo/{BENCH_REFERENCE_FILE} 2>&1"
+
+    result = run_on_host(jump_host, remote_dir, compile_cmd, run_cmd, "Intel original")
+
+    assert result.ok, f"Compilation or execution failed:\n{result.stdout}\n{result.stderr}"
+    assert "target_name:" in result.stdout, f"Expected alignment output, got:\n{result.stdout}"
