@@ -30,10 +30,22 @@ from src.config import (
     LLM_VALIDATION_RETRIES,
     PROJECT_DIR,
     REACT_MAX_STEPS,
+    REMOTE_DIR,
     RISCVCC,
     SIMULATOR,
     SSH_CC,
     SSH_CXX,
+    SSH_HOST,
+    SSH_JUMP_HOST,
+)
+from src.benchmark import (
+    BenchmarkResult,
+    REFERENCE_FILE as BENCH_REFERENCE_FILE,
+    check_ssh,
+    compare_outputs,
+    run_on_host,
+    upload_datasets,
+    upload_to_host,
 )
 from src.search_replace import apply_search_replace, extract_search_replace
 from src.llm_utils import create_llm
@@ -212,7 +224,7 @@ def default_ssh_compile_command() -> str:
 
 def default_ssh_run_command() -> str:
     """Default run command for real RISC-V hardware via SSH."""
-    return "./ssw_test demo/10M.fa demo/54mer_hap1_1.100.fa 2>&1"
+    return "./ssw_test demo/10k.fa demo/54mer_hap1_1.100.fa 2>&1"
 
 
 def _build_zlib_command() -> str:
@@ -245,7 +257,7 @@ def default_build_command(target_file: str) -> str:
         f'echo "=== Compiling ===" && '
         f'{RISCVCC} {cflags} main.c ssw.c -o ssw_test {ldflags} 2>&1 && '
         f'echo "=== Compilation succeeded, running under QEMU ===" && '
-        f'{SIMULATOR} ./ssw_test demo/10M.fa demo/54mer_hap1_1.100.fa 2>&1 && '
+        f'{SIMULATOR} ./ssw_test demo/10k.fa demo/54mer_hap1_1.100.fa 2>&1 && '
         f'echo "=== Execution succeeded ==="'
     )
 
@@ -255,6 +267,9 @@ def default_build_command(target_file: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+CORRECTNESS_DATASET = "10k.fa"
+
+
 class TranslationAgent:
     """LLM-driven SSE→RISC-V translation with compile-fix loop using sse2rvv.h."""
 
@@ -262,6 +277,104 @@ class TranslationAgent:
         self.docker_validator = DockerValidator()
         self.ssh_validator = SSHValidator()
         self.llm: LLM = create_llm()
+        self._intel_reference: BenchmarkResult | None = None
+        self._intel_reference_computed = False
+
+    def _get_intel_reference(self, source_dir: Path, test_data_dir: Path | None) -> BenchmarkResult | None:
+        """Compute reference output by running original code on Intel (jump host). Cached after first call."""
+        if self._intel_reference_computed:
+            return self._intel_reference
+
+        self._intel_reference_computed = True
+        jump_host = SSH_JUMP_HOST
+        if not check_ssh(jump_host):
+            logger.warning("Jump host %s not reachable; correctness check disabled", jump_host)
+            return None
+
+        jump_remote = f"{REMOTE_DIR}-correctness-ref"
+        dataset_dir = test_data_dir if test_data_dir and test_data_dir.is_dir() else DATASETS_DIR
+
+        dataset_file = dataset_dir / CORRECTNESS_DATASET
+        if not dataset_file.exists():
+            logger.warning("Correctness dataset %s not found; correctness check disabled", dataset_file)
+            return None
+
+        # Upload original source files
+        original_files = [p for p in source_dir.iterdir() if p.is_file()]
+        logger.info("Uploading original code to %s for correctness reference ...", jump_host)
+        if not upload_to_host(jump_host, jump_remote, original_files):
+            logger.warning("Failed to upload original code to jump; correctness check disabled")
+            return None
+        if not upload_datasets(jump_host, jump_remote, dataset_dir, CORRECTNESS_DATASET):
+            logger.warning("Failed to upload datasets to jump; correctness check disabled")
+            return None
+
+        run_cmd = f"./ssw_test demo/{CORRECTNESS_DATASET} demo/{BENCH_REFERENCE_FILE} 2>&1"
+        compile_cmd = "gcc -O2 -o ssw_test main.c ssw.c -lm -lz 2>&1"
+
+        result = run_on_host(jump_host, jump_remote, compile_cmd, run_cmd, "Intel reference")
+        if not result.ok:
+            logger.warning("Intel reference run failed; correctness check disabled\n%s", result.stderr)
+            return None
+
+        logger.info("Intel reference output computed (%d chars)", len(result.stdout))
+        self._intel_reference = result
+        return result
+
+    def _validate_correctness(self, workspace_dir: Path) -> ValidationResult | None:
+        """Run translated code on RISC-V with correctness dataset and compare against Intel reference.
+
+        Returns None if correctness check is not available, a ValidationResult otherwise.
+        """
+        if self._intel_reference is None:
+            return None
+
+        final_host = SSH_HOST
+        final_remote = f"{REMOTE_DIR}-correctness-check"
+
+        # Upload translated code
+        all_paths = [p for p in workspace_dir.iterdir()]
+        if not upload_to_host(final_host, final_remote, all_paths):
+            logger.warning("Failed to upload translated code for correctness check")
+            return None
+
+        dataset_dir = DATASETS_DIR
+        if not upload_datasets(final_host, final_remote, dataset_dir, CORRECTNESS_DATASET):
+            logger.warning("Failed to upload datasets for correctness check")
+            return None
+
+        run_cmd = f"./ssw_test demo/{CORRECTNESS_DATASET} demo/{BENCH_REFERENCE_FILE} 2>&1"
+        compile_cmd = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm -lz 2>&1"
+
+        riscv_result = run_on_host(final_host, final_remote, compile_cmd, run_cmd, "RISC-V correctness")
+        if not riscv_result.ok:
+            return ValidationResult(
+                ok=False,
+                stage="correctness",
+                returncode=riscv_result.ok,
+                stdout=riscv_result.stdout,
+                stderr=f"RISC-V correctness run failed:\n{riscv_result.stderr}",
+            )
+
+        match, details = compare_outputs(self._intel_reference, riscv_result)
+        if match:
+            logger.info("Correctness check PASSED: outputs match Intel reference")
+            return ValidationResult(ok=True, stage="correctness", returncode=0, stdout=details, stderr="")
+
+        logger.warning("Correctness check FAILED: outputs differ from Intel reference")
+        return ValidationResult(
+            ok=False,
+            stage="correctness",
+            returncode=1,
+            stdout="",
+            stderr=(
+                "CORRECTNESS FAILURE: The translated RISC-V code produces different "
+                "alignment results than the original Intel SSE code.\n\n"
+                f"{details}\n\n"
+                "The SIMD translation has a bug that causes incorrect computation. "
+                "Fix the translated code so it produces the same output as the original."
+            ),
+        )
 
     def _generate_valid_file(
         self,
@@ -454,6 +567,9 @@ class TranslationAgent:
 
         workspaces = create_workspace(source_dir, snapshot, test_data_dir)
 
+        # Compute Intel reference output for correctness checking
+        self._get_intel_reference(source_dir, test_data_dir)
+
         try:
             # --- Baseline validation ---
             baseline = self.docker_validator.validate(
@@ -477,25 +593,35 @@ class TranslationAgent:
                         ssh_files, ssh_compile_command, ssh_run_command
                     )
                     if ssh_result.ok:
-                        logger.info("Input already passes all validations")
-                        write_output(output_dir, snapshot)
-                        return 0
-                    logger.warning(
-                        "Baseline passes QEMU but fails SSH at stage %s; "
-                        "proceeding with repair\n%s",
-                        ssh_result.stage,
-                        ssh_result.combined_output,
-                    )
-                    baseline = ValidationResult(
-                        ok=False,
-                        stage=ssh_result.stage,
-                        returncode=ssh_result.returncode,
-                        stdout=ssh_result.stdout,
-                        stderr=(
-                            "Passed QEMU emulation but FAILED on real RISC-V hardware.\n"
-                            f"{ssh_result.combined_output}"
-                        ),
-                    )
+                        # Correctness check against Intel reference
+                        correctness = self._validate_correctness(workspaces.workspace_dir)
+                        if correctness is None or correctness.ok:
+                            logger.info("Input already passes all validations")
+                            write_output(output_dir, snapshot)
+                            return 0
+                        logger.warning(
+                            "Baseline passes SSH but fails correctness check; "
+                            "proceeding with repair\n%s",
+                            correctness.combined_output,
+                        )
+                        baseline = correctness
+                    else:
+                        logger.warning(
+                            "Baseline passes QEMU but fails SSH at stage %s; "
+                            "proceeding with repair\n%s",
+                            ssh_result.stage,
+                            ssh_result.combined_output,
+                        )
+                        baseline = ValidationResult(
+                            ok=False,
+                            stage=ssh_result.stage,
+                            returncode=ssh_result.returncode,
+                            stdout=ssh_result.stdout,
+                            stderr=(
+                                "Passed QEMU emulation but FAILED on real RISC-V hardware.\n"
+                                f"{ssh_result.combined_output}"
+                            ),
+                        )
                 else:
                     logger.info("Input already passes Docker/QEMU validation")
                     write_output(output_dir, snapshot)
@@ -560,28 +686,38 @@ class TranslationAgent:
                             ssh_files, ssh_compile_command, ssh_run_command
                         )
                         if ssh_result.ok:
-                            write_output(output_dir, current_snapshot)
-                            logger.info(
-                                "Translation succeeded; wrote output to %s",
-                                output_dir,
+                            # Correctness check against Intel reference
+                            correctness = self._validate_correctness(workspaces.workspace_dir)
+                            if correctness is None or correctness.ok:
+                                write_output(output_dir, current_snapshot)
+                                logger.info(
+                                    "Translation succeeded; wrote output to %s",
+                                    output_dir,
+                                )
+                                return 0
+                            logger.warning(
+                                "Step %d passed SSH but failed correctness check\n%s",
+                                step,
+                                correctness.combined_output,
                             )
-                            return 0
-                        logger.warning(
-                            "Step %d passed QEMU but failed SSH at stage %s\n%s",
-                            step,
-                            ssh_result.stage,
-                            ssh_result.combined_output,
-                        )
-                        latest_validation = ValidationResult(
-                            ok=False,
-                            stage=ssh_result.stage,
-                            returncode=ssh_result.returncode,
-                            stdout=ssh_result.stdout,
-                            stderr=(
-                                "Passed QEMU emulation but FAILED on real hardware.\n"
-                                f"{ssh_result.combined_output}"
-                            ),
-                        )
+                            latest_validation = correctness
+                        else:
+                            logger.warning(
+                                "Step %d passed QEMU but failed SSH at stage %s\n%s",
+                                step,
+                                ssh_result.stage,
+                                ssh_result.combined_output,
+                            )
+                            latest_validation = ValidationResult(
+                                ok=False,
+                                stage=ssh_result.stage,
+                                returncode=ssh_result.returncode,
+                                stdout=ssh_result.stdout,
+                                stderr=(
+                                    "Passed QEMU emulation but FAILED on real hardware.\n"
+                                    f"{ssh_result.combined_output}"
+                                ),
+                            )
                     else:
                         # No SSH configured — QEMU pass is success
                         write_output(output_dir, current_snapshot)

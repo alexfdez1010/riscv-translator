@@ -1,4 +1,4 @@
-.PHONY: all sync test translate check clean
+.PHONY: all sync test translate check benchmark clean
 
 all: sync
 
@@ -17,6 +17,10 @@ translate:
 
 check:
 	uv run python -m src.check $(OUTPUT_DIR)
+
+BENCHMARK_DATASET ?= 1M.fa
+benchmark:
+	uv run python -m src.benchmark --dataset $(BENCHMARK_DATASET)
 
 clean:
 	rm -rf __pycache__ .pytest_cache

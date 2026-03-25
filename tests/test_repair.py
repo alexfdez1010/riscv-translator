@@ -343,6 +343,6 @@ def test_default_build_command_generates_compile_command():
     assert "main.c ssw.c" in cmd
     assert "ssw_test" in cmd
     assert "-lm -lz" in cmd
-    assert "demo/10M.fa" in cmd
+    assert "demo/10k.fa" in cmd
     assert "Building zlib" in cmd
     assert "Compilation succeeded" in cmd
