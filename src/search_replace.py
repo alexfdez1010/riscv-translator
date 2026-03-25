@@ -172,9 +172,6 @@ def _was_already_applied(
         # (the prior block already transformed it)
         if block.search in prev_replace:
             return True
-    # The replacement is already present in the file
-    if block.replace and block.replace in current_text:
-        return True
     return False
 
 

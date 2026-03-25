@@ -447,6 +447,33 @@ class TestApplySearchReplaceDuplicates:
         result = apply_search_replace(original, blocks)
         assert result == "new_val\n"
 
+    def test_same_replacement_in_different_functions_not_skipped(self):
+        """Block targeting function B must NOT be skipped just because
+        function A already contains the same replacement text.
+
+        Regression test: the LLM fixes pointer arithmetic in sw_sse2_word
+        (step 1), then sends a block to fix the same pattern in sw_sse2_byte
+        (step 2).  The replacement text already exists in sw_sse2_word, but
+        the block for sw_sse2_byte must still be applied.
+        """
+        original = (
+            "void func_a() {\n"
+            "    x = *(ptr + (size_t)j * VSIZE);  // already fixed\n"
+            "}\n"
+            "void func_b() {\n"
+            "    x = ptr[j];  // needs fixing\n"
+            "}\n"
+        )
+        blocks = [
+            SearchReplaceBlock(
+                search="    x = ptr[j];  // needs fixing",
+                replace="    x = *(ptr + (size_t)j * VSIZE);  // already fixed",
+            ),
+        ]
+        result = apply_search_replace(original, blocks)
+        assert result.count("*(ptr + (size_t)j * VSIZE)") == 2
+        assert "ptr[j]" not in result
+
 
 # =====================================================================
 # apply_search_replace — fuzzy/whitespace matching
