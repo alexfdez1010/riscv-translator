@@ -344,6 +344,74 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
     assert output_dir.exists()
 
 
+def test_run_continues_after_edit_failure(monkeypatch, tmp_path):
+    """When _generate_valid_file returns None with edit-failure stage, run()
+    should continue to the next step instead of stopping early."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "lib.cpp").write_text("broken\n")
+    output_dir = tmp_path / "out"
+
+    _patch_infra(monkeypatch, tmp_path, docker_ok=False)
+
+    call_count = 0
+
+    def fake_generate(self, messages, snapshot, file_name, workspaces, build_command):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First step: edit-failure (no valid edits extracted)
+            return None, ValidationResult(False, "edit-failure", None, "", "No validation attempted.")
+        # Second step: succeed
+        return (
+            repair.SourceSnapshot(files={**snapshot.files, "lib.cpp": "fixed code"}),
+            ValidationResult(True, "validation", 0, "ok", ""),
+        )
+
+    monkeypatch.setattr(repair.TranslationAgent, "_generate_valid_file", fake_generate)
+    monkeypatch.setattr(repair, "write_output", lambda d, s: d.mkdir(parents=True, exist_ok=True) or (d / "lib.cpp").write_text(s.files["lib.cpp"]))
+
+    rc = repair.TranslationAgent().run(
+        source_dir=source_dir,
+        target_file="lib.cpp",
+        output_dir=output_dir,
+        max_steps=3,
+    )
+
+    assert rc == 0
+    assert call_count >= 2, "Should have continued past the edit-failure step"
+    assert (output_dir / "lib.cpp").read_text() == "fixed code"
+
+
+def test_run_stops_early_on_internal_error(monkeypatch, tmp_path):
+    """When _generate_valid_file returns None with internal-error stage (e.g.
+    LLM API failure), run() should stop early and return 1."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "lib.cpp").write_text("broken\n")
+    output_dir = tmp_path / "out"
+
+    _patch_infra(monkeypatch, tmp_path, docker_ok=False)
+
+    monkeypatch.setattr(
+        repair.TranslationAgent,
+        "_generate_valid_file",
+        lambda self, messages, snapshot, file_name, workspaces, build_command: (
+            None,
+            ValidationResult(False, "internal-error", None, "", "API key expired"),
+        ),
+    )
+
+    rc = repair.TranslationAgent().run(
+        source_dir=source_dir,
+        target_file="lib.cpp",
+        output_dir=output_dir,
+        max_steps=5,
+    )
+
+    assert rc == 1
+
+
 # ---------------------------------------------------------------------------
 # Default build command test
 # ---------------------------------------------------------------------------

@@ -373,7 +373,7 @@ class TranslationAgent:
         current_snapshot = snapshot
         latest_validation = ValidationResult(
             ok=False,
-            stage="internal-error",
+            stage="edit-failure",
             returncode=None,
             stdout="",
             stderr="No validation attempted.",
@@ -655,7 +655,10 @@ class TranslationAgent:
                             latest_validation.stderr,
                         )
                         return 1
-                    logger.info("Step %d did not yield a valid candidate", step)
+                    logger.info(
+                        "Step %d did not yield a valid candidate (%s), continuing",
+                        step, latest_validation.stage,
+                    )
                     continue
 
                 if latest_validation.ok:
