@@ -6,7 +6,6 @@
 
 #include <stdlib.h>
 #include <stdint.h>
-#include <zlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
@@ -15,7 +14,11 @@
 #include "ssw.h"
 #include "kseq.h"
 
+#ifdef __ARM_NEON // (M1)
+#include "sse2neon.h"
+#else // x86 (Intel)
 #include "sse2rvv.h"
+#endif
 
 
 #ifdef __GNUC__
@@ -33,7 +36,12 @@
  */
 #define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
 
-KSEQ_INIT(gzFile, gzread)
+/* Simple fread wrapper compatible with kseq.h's KSEQ_INIT macro */
+static int fileread(FILE *fp, char *buf, int len) {
+	return (int)fread(buf, 1, len, fp);
+}
+
+KSEQ_INIT(FILE*, fileread)
 
 // Global scoring matrices
 static const int8_t mat50[] = {
@@ -391,7 +399,7 @@ static int initialize_scoring_matrix(int32_t match, int32_t mismatch, int32_t pr
 int main (int argc, char * const argv[]) {
 	clock_t start, end;
 	float cpu_time;
-	gzFile read_fp, ref_fp;
+	FILE *read_fp, *ref_fp;
 	kseq_t *read_seq, *ref_seq;
 	int32_t l, m, match = 2, mismatch = 2, gap_open = 3, gap_extension = 1, path = 0, reverse = 0, n = 5, sam = 0, protein = 0, header = 0, s1 = 67108864, s2 = 128, filter = 0;
     int8_t *mata, *ref_num, *num, *num_rc = 0;
@@ -427,21 +435,21 @@ int main (int argc, char * const argv[]) {
 		return 1;
 	}
 
-	read_fp = gzopen(argv[file_arg_start + 1], "r");
+	read_fp = fopen(argv[file_arg_start + 1], "r");
 
     if (! read_fp) {
-        fprintf (stderr, "gzopen of '%s' failed.\n", argv[file_arg_start + 1]);
+        fprintf (stderr, "fopen of '%s' failed.\n", argv[file_arg_start + 1]);
             exit (EXIT_FAILURE);
     }
 
 	read_seq = kseq_init(read_fp);
 	if (sam && header && path) {
 		fprintf(stdout, "@HD\tVN:1.4\tSO:queryname\n");
-		ref_fp = gzopen(argv[file_arg_start], "r");
+		ref_fp = fopen(argv[file_arg_start], "r");
 		ref_seq = kseq_init(ref_fp);
 		while ((l = kseq_read(ref_seq)) >= 0) fprintf(stdout, "@SQ\tSN:%s\tLN:%d\n", ref_seq->name.s, (int32_t)ref_seq->seq.l);
 		kseq_destroy(ref_seq);
-		gzclose(ref_fp);
+		fclose(ref_fp);
 	} else if (sam && !path) {
 		fprintf(stderr, "SAM format output is only available together with option -c.\n");
 		sam = 0;
@@ -486,7 +494,7 @@ int main (int argc, char * const argv[]) {
             return 1;
 		}
 
-		ref_fp = gzopen(argv[file_arg_start], "r");
+		ref_fp = fopen(argv[file_arg_start], "r");
 		ref_seq = kseq_init(ref_fp);
 		while (kseq_read(ref_seq) >= 0) {
 			s_align* result, *result_rc = 0;
@@ -524,7 +532,7 @@ int main (int argc, char * const argv[]) {
 		if(p_rc) init_destroy(p_rc);
 		init_destroy(p);
 		kseq_destroy(ref_seq);
-		gzclose(ref_fp);
+		fclose(ref_fp);
 	}
 	end = clock();
 	cpu_time = ((float) (end - start)) / CLOCKS_PER_SEC;
@@ -535,7 +543,7 @@ int main (int argc, char * const argv[]) {
 		free(read_rc);
 	}
 	kseq_destroy(read_seq);
-	gzclose(read_fp);
+	fclose(read_fp);
 	free(num);
 	free(ref_num);
  	free(mata);

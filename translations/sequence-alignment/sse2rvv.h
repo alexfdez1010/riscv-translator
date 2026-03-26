@@ -67,21 +67,6 @@ typedef vfloat32m1_t __m128;  /* 128-bit vector containing 4 floats */
 typedef vfloat64m1_t __m128d; /* 128-bit vector containing 2 doubles */
 typedef vint32m1_t __m128i;   /* 128-bit vector containing integers */
 
-/* Runtime size (in bytes) of one RVV vector register (LMUL=1).
- * On RISC-V this reads the 'vlenb' CSR, so it adapts automatically to the
- * hardware VLEN.  Use this instead of sizeof(__m128i) — the compiler rejects
- * sizeof() on scalable RVV types.
- *
- * For memory allocation:   malloc(n * SSE2RVV_VTYPE_SIZE)
- * For pointer arithmetic:  (uint8_t*)ptr + i * SSE2RVV_VTYPE_SIZE
- */
-static inline size_t __sse2rvv_vtype_size(void) {
-    size_t vlenb;
-    __asm__ __volatile__("csrr %0, vlenb" : "=r"(vlenb));
-    return vlenb;
-}
-#define SSE2RVV_VTYPE_SIZE __sse2rvv_vtype_size()
-
 // A struct is defined in this header file called 'SIMDVec' which can be used
 // by applications which attempt to access the contents of an __m128 struct
 // directly.  It is important to note that accessing the __m128 struct directly
@@ -3207,7 +3192,7 @@ FORCE_INLINE void _mm_store_sd(double *mem_addr, __m128d a) {
 }
 
 FORCE_INLINE void _mm_store_si128(__m128i *mem_addr, __m128i a) {
-  *mem_addr = a;
+  __riscv_vse32_v_i32m1((int32_t *)mem_addr, a, 4);
 }
 
 FORCE_INLINE void _mm_store_ss(float *mem_addr, __m128 a) {

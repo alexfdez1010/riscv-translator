@@ -165,7 +165,7 @@ static __m128i* qP_byte (const int8_t* read_num,
 								     Each piece is 8 bit. Split the read into 16 segments.
 								     Calculat 16 segments in parallel.
 								   */
-	__m128i* vProfile = (__m128i*)malloc(n * segLen * SSE2RVV_VTYPE_SIZE);
+	__m128i* vProfile = (__m128i*)malloc(n * segLen * 16);
 	int8_t* t = (int8_t*)vProfile;
 	int32_t nt, i, j, segNum;
 
@@ -224,10 +224,10 @@ static alignment_end* sw_sse2_byte (const int8_t* ref,
 	/* Define 16 byte 0 vector. */
 	__m128i vZero = _mm_set1_epi32(0);
 
-	__m128i* pvHStore = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvHLoad = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvE = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvHmax = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
+	__m128i* pvHStore = (__m128i*) calloc(segLen, 16);
+	__m128i* pvHLoad = (__m128i*) calloc(segLen, 16);
+	__m128i* pvE = (__m128i*) calloc(segLen, 16);
+	__m128i* pvHmax = (__m128i*) calloc(segLen, 16);
 
 	int32_t i, j, k;
 	/* 16 byte insertion begin vector */
@@ -256,9 +256,9 @@ static alignment_end* sw_sse2_byte (const int8_t* ref,
 							   Any errors to vH values will be corrected in the Lazy_F loop.
 							 */
 
-		__m128i vH = *(__m128i*)((uint8_t*)pvHStore + (size_t)(segLen - 1) * SSE2RVV_VTYPE_SIZE);
+		__m128i vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + (segLen - 1) * 16));
 		vH = _mm_slli_si128 (vH, 1); /* Shift the 128-bit value in vH left by 1 byte. */
-		const __m128i* vP = (const __m128i*)((const uint8_t*)vProfile + (size_t)ref[i] * segLen * SSE2RVV_VTYPE_SIZE); /* Right part of the vProfile */
+		const __m128i* vP = (const __m128i*)((uint8_t*)vProfile + ref[i] * segLen * 16); /* Right part of the vProfile */
 
 		/* Swap the 2 H buffers. */
 		__m128i* pv = pvHLoad;
@@ -267,40 +267,40 @@ static alignment_end* sw_sse2_byte (const int8_t* ref,
 
 		/* inner loop to process the query sequence */
 		for (j = 0; LIKELY(j < segLen); ++j) {
-			vH = _mm_adds_epu8(vH, _mm_load_si128((const __m128i*)((const uint8_t*)vP + (size_t)j * SSE2RVV_VTYPE_SIZE)));
+			vH = _mm_adds_epu8(vH, _mm_load_si128((const __m128i*)((uint8_t*)vP + j * 16)));
 			vH = _mm_subs_epu8(vH, vBias); /* vH will be always > 0 */
 
 			/* Get max from vH, vE and vF. */
-			e = *(__m128i*)((uint8_t*)pvE + (size_t)j * SSE2RVV_VTYPE_SIZE);
+			e = _mm_load_si128((const __m128i*)((uint8_t*)pvE + j * 16));
 			vH = _mm_max_epu8(vH, e);
 			vH = _mm_max_epu8(vH, vF);
 			vMaxColumn = _mm_max_epu8(vMaxColumn, vH);
 
 			/* Save vH values. */
-			*(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE) = vH;
+			_mm_store_si128((__m128i*)((uint8_t*)pvHStore + j * 16), vH);
 
 			/* Update vE value. */
 			vH = _mm_subs_epu8(vH, vGapO); /* saturation arithmetic, result >= 0 */
 			e = _mm_subs_epu8(e, vGapE);
 			e = _mm_max_epu8(e, vH);
-			*(__m128i*)((uint8_t*)pvE + (size_t)j * SSE2RVV_VTYPE_SIZE) = e;
+			_mm_store_si128((__m128i*)((uint8_t*)pvE + j * 16), e);
 
 			/* Update vF value. */
 			vF = _mm_subs_epu8(vF, vGapE);
 			vF = _mm_max_epu8(vF, vH);
 
 			/* Load the next vH. */
-			vH = *(__m128i*)((uint8_t*)pvHLoad + (size_t)j * SSE2RVV_VTYPE_SIZE);
+			vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHLoad + j * 16));
 		}
 
         /* Lazy_F loop: has been revised to disallow adjecent insertion and then deletion, so don't update E(i, j), learn from SWPS3 */
 		for (k = 0; LIKELY(k < 16); ++k) {
 			vF = _mm_slli_si128 (vF, 1);
 			for (j = 0; LIKELY(j < segLen); ++j) {
-				vH = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
+				vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + j * 16));
 				vH = _mm_max_epu8(vH, vF);
 	    		vMaxColumn = _mm_max_epu8(vMaxColumn, vH);	// newly added line
-				*(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE) = vH;
+				_mm_store_si128((__m128i*)((uint8_t*)pvHStore + j * 16), vH);
 				vH = _mm_subs_epu8(vH, vGapO);
 				vF = _mm_subs_epu8(vF, vGapE);
                 vTemp = _mm_subs_epu8(vF, vH);
@@ -325,7 +325,7 @@ end:
 				end_ref = i;
 
 				/* Store the column with the highest alignment score in order to trace the alignment ending position on read. */
-				for (j = 0; LIKELY(j < segLen); ++j) *(__m128i*)((uint8_t*)pvHmax + (size_t)j * SSE2RVV_VTYPE_SIZE) = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
+				for (j = 0; LIKELY(j < segLen); ++j) _mm_store_si128((__m128i*)((uint8_t*)pvHmax + j * 16), _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + j * 16)));
 			}
 		}
 
@@ -386,7 +386,7 @@ static __m128i* qP_word (const int8_t* read_num,
 				  const int32_t n) {
 
 	int32_t segLen = (readLen + 7) / 8;
-	__m128i* vProfile = (__m128i*)malloc(n * segLen * SSE2RVV_VTYPE_SIZE);
+	__m128i* vProfile = (__m128i*)malloc(n * segLen * 16);
 	int16_t* t = (int16_t*)vProfile;
 	int32_t nt, i, j;
 	int32_t segNum;
@@ -433,10 +433,10 @@ static alignment_end* sw_sse2_word (const int8_t* ref,
 	/* Define 16 byte 0 vector. */
 	__m128i vZero = _mm_set1_epi32(0);
 
-	__m128i* pvHStore = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvHLoad = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvE = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
-	__m128i* pvHmax = (__m128i*) calloc(segLen, SSE2RVV_VTYPE_SIZE);
+	__m128i* pvHStore = (__m128i*) calloc(segLen, 16);
+	__m128i* pvHLoad = (__m128i*) calloc(segLen, 16);
+	__m128i* pvE = (__m128i*) calloc(segLen, 16);
+	__m128i* pvHmax = (__m128i*) calloc(segLen, 16);
 
 	int32_t i, j, k;
 	/* 16 byte insertion begin vector */
@@ -461,7 +461,7 @@ static alignment_end* sw_sse2_word (const int8_t* ref,
 		__m128i e, vF = vZero; /* Initialize F value to 0.
 							   Any errors to vH values will be corrected in the Lazy_F loop.
 							 */
-		__m128i vH = *(__m128i*)((uint8_t*)pvHStore + (size_t)(segLen - 1) * SSE2RVV_VTYPE_SIZE);
+		__m128i vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + (segLen - 1) * 16));
 		vH = _mm_slli_si128 (vH, 2); /* Shift the 128-bit value in vH left by 2 byte. */
 
 		/* Swap the 2 H buffers. */
@@ -469,45 +469,45 @@ static alignment_end* sw_sse2_word (const int8_t* ref,
 
 		__m128i vMaxColumn = vZero; /* vMaxColumn is used to record the max values of column i. */
 
-		const __m128i* vP = (const __m128i*)((const uint8_t*)vProfile + (size_t)ref[i] * segLen * SSE2RVV_VTYPE_SIZE); /* Right part of the vProfile */
+		const __m128i* vP = (const __m128i*)((uint8_t*)vProfile + ref[i] * segLen * 16); /* Right part of the vProfile */
 		pvHLoad = pvHStore;
 		pvHStore = pv;
 
 		/* inner loop to process the query sequence */
 		for (j = 0; LIKELY(j < segLen); j ++) {
-			vH = _mm_adds_epi16(vH, _mm_load_si128((const __m128i*)((const uint8_t*)vP + (size_t)j * SSE2RVV_VTYPE_SIZE)));
+			vH = _mm_adds_epi16(vH, _mm_load_si128((const __m128i*)((uint8_t*)vP + j * 16)));
 
 			/* Get max from vH, vE and vF. */
-			e = *(__m128i*)((uint8_t*)pvE + (size_t)j * SSE2RVV_VTYPE_SIZE);
+			e = _mm_load_si128((const __m128i*)((uint8_t*)pvE + j * 16));
 			vH = _mm_max_epi16(vH, e);
 			vH = _mm_max_epi16(vH, vF);
 			vMaxColumn = _mm_max_epi16(vMaxColumn, vH);
 
 			/* Save vH values. */
-			*(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE) = vH;
+			_mm_store_si128((__m128i*)((uint8_t*)pvHStore + j * 16), vH);
 
 			/* Update vE value. */
 			vH = _mm_subs_epu16(vH, vGapO); /* saturation arithmetic, result >= 0 */
 			e = _mm_subs_epu16(e, vGapE);
 			e = _mm_max_epi16(e, vH);
-			*(__m128i*)((uint8_t*)pvE + (size_t)j * SSE2RVV_VTYPE_SIZE) = e;
+			_mm_store_si128((__m128i*)((uint8_t*)pvE + j * 16), e);
 
 			/* Update vF value. */
 			vF = _mm_subs_epu16(vF, vGapE);
 			vF = _mm_max_epi16(vF, vH);
 
 			/* Load the next vH. */
-			vH = *(__m128i*)((uint8_t*)pvHLoad + (size_t)j * SSE2RVV_VTYPE_SIZE);
+			vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHLoad + j * 16));
 		}
 
 		/* Lazy_F loop: has been revised to disallow adjecent insertion and then deletion, so don't update E(i, j), learn from SWPS3 */
 		for (k = 0; LIKELY(k < 8); ++k) {
 			vF = _mm_slli_si128 (vF, 2);
 			for (j = 0; LIKELY(j < segLen); ++j) {
-				vH = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
+				vH = _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + j * 16));
 				vH = _mm_max_epi16(vH, vF);
 				vMaxColumn = _mm_max_epi16(vMaxColumn, vH); //newly added line
-				*(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE) = vH;
+				_mm_store_si128((__m128i*)((uint8_t*)pvHStore + j * 16), vH);
 				vH = _mm_subs_epu16(vH, vGapO);
 				vF = _mm_subs_epu16(vF, vGapE);
 				if (UNLIKELY(! _mm_movemask_epi8(_mm_cmpgt_epi16(vF, vH)))) goto end;
@@ -527,7 +527,7 @@ end:
 			if (LIKELY(temp > max)) {
 				max = temp;
 				end_ref = i;
-				for (j = 0; LIKELY(j < segLen); ++j) *(__m128i*)((uint8_t*)pvHmax + (size_t)j * SSE2RVV_VTYPE_SIZE) = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
+				for (j = 0; LIKELY(j < segLen); ++j) _mm_store_si128((__m128i*)((uint8_t*)pvHmax + j * 16), _mm_load_si128((const __m128i*)((uint8_t*)pvHStore + j * 16)));
 			}
 		}
 
@@ -860,7 +860,6 @@ s_align* ssw_align (const s_profile* prof,
 	alignment_end* bests = 0, *bests_reverse = 0;
 	__m128i* vP = 0;
 	int32_t word = 0, band_width = 0, readLen = prof->readLen;
-	int32_t full_band;
 	int8_t* read_reverse = 0;
 	cigar* path;
 	s_align* r = (s_align*)calloc(1, sizeof(s_align));
@@ -937,7 +936,7 @@ s_align* ssw_align (const s_profile* prof,
 	refLen = r->ref_end1 - r->ref_begin1 + 1;
 	readLen = r->read_end1 - r->read_begin1 + 1;
 	band_width = abs(refLen - readLen) + 1;
-	full_band = refLen > readLen ? refLen : readLen;
+	int32_t full_band = refLen > readLen ? refLen : readLen;
 	while (1) {
 		path = banded_sw(ref + r->ref_begin1, prof->read + r->read_begin1, refLen, readLen, r->score1, weight_gapO, weight_gapE, band_width, prof->mat, prof->n);
 		if (path == 0) break;
