@@ -15,27 +15,50 @@ pipeline works with any SSE-based codebase.
 
 1. **Input**: A directory of C/C++ source files using SSE intrinsics.
 2. **Pre-processing**: SSE `#include` directives are replaced with `#include "sse2rvv.h"`.
-3. **Compile-fix loop**: The code is compiled in Docker with the RISC-V
-   toolchain + QEMU emulator.  Compiler errors are fed back to the LLM
-   which produces minimal diffs until compilation succeeds.
-4. **Simulator validation**: The binary runs under QEMU to verify correctness.
-5. **Hardware validation**: If SSH to real RISC-V hardware is available, the
-   code is also compiled and run there.
-6. **Output**: The final translated source file.
+3. **Compile-fix loop**: The code is cross-compiled in Docker with the RISC-V
+   toolchain.  The binary runs under the Spike RISC-V ISA simulator.  Compiler
+   or runtime errors are fed back to the LLM, which produces minimal
+   search/replace diffs until the code compiles and runs successfully.
+4. **Simulator validation**: The binary runs under Spike to verify execution.
+5. **Hardware validation** *(optional)*: If SSH to real RISC-V hardware is
+   available, the code is also compiled and run there.
+6. **Correctness check** *(optional)*: Output is compared against an Intel x86
+   reference to verify functional equivalence.
+7. **Output**: The final translated source files.
+
+## SSW source modifications
+
+The original SSW library depends on `zlib` for reading FASTA files (`gzopen`,
+`gzread`, etc.).  In this repository, `initial_code/main.c` has been modified
+to use standard C file I/O (`fopen`, `fread`, `fgets`) instead.  This avoids
+the `zlib` dependency, which is not available in the bare-metal RISC-V
+toolchain (`riscv64-unknown-elf-gcc`).  The core algorithm (`ssw.c`) is
+unchanged.
+
+## Vector width
+
+The translated code uses a fixed 128-bit vector width to match SSE semantics,
+even if the target hardware has wider registers.  The priority in this phase
+was correctness: translating SSE intrinsics while simultaneously widening to
+an arbitrary VLEN introduced too many degrees of freedom for the LLM to
+converge reliably.  Constraining to 128 bits keeps the task tractable.
+Future work: an evolutionary algorithm will optimize the initial translation
+to use the hardware's full register width.
 
 ## Repository layout
 
 ```
 src/               — Python package (translation agent, validators, LLM client)
-initial_code/      — Original SSW source files (SSE2) + sse2rvv.h compatibility header
-tests/             — Python test suite
-dataset/           — FASTA test data (for SSW example)
-docs/              — RVV reference material for LLM context
+initial_code/      — Original SSW source files (SSE2, zlib removed) + sse2rvv.h subset
+translations/      — Successfully translated outputs (e.g., sequence-alignment/)
+datasets/          — FASTA test data for SSW benchmarking
+tests/             — Python test suite (pytest)
+docs/              — RVV reference material loaded as LLM context
 ```
 
 ## Python environment
 
-This project uses **`uv`** exclusively.
+This project uses **`uv`** exclusively.  Only dependency: `python-dotenv`.
 
 ```bash
 uv sync          # install deps
@@ -49,6 +72,8 @@ uv sync --dev    # install dev deps (pytest)
 | `make test` | Run Python tests (`uv run pytest tests/ -v --tb=short`) |
 | `make sync` | Install/update Python dependencies |
 | `make translate SOURCE_DIR=... TARGET_FILE=... OUTPUT_DIR=...` | Run translation pipeline |
+| `make check OUTPUT_DIR=...` | Validate a translation output directory |
+| `make benchmark BENCHMARK_DATASET=...` | Compare Intel vs RISC-V execution |
 | `make clean` | Remove build artifacts |
 
 ### Direct invocation
@@ -64,12 +89,14 @@ uv run python -m src.repair <source_dir> <target_file> <output_dir> \
 ## Architecture notes
 
 - **Translation agent**: `src/repair.py` — `TranslationAgent` orchestrates the LLM compile-fix loop.
-- **LLM client**: `src/llm_utils.py` — `create_llm()` returns an `LLM` protocol object using OpenRouter.
+- **LLM client**: `src/llm_utils.py` — `create_llm()` returns an `LLM` protocol object using OpenRouter (with retry/backoff on 429).
 - **LLM types**: `src/llm_types.py` — `Message`, `LLM`, `llm_fn` (no external dependency).
 - **Config**: `src/config.py` — all tunables, overridable via environment variables (see `.env.example`).
-- **Validators**: `src/validators.py` — `DockerValidator` (QEMU emulation) and `SSHValidator` (real hardware).
-- **Prompts**: `src/prompts.py` — generic SSE→sse2rvv.h translation prompts (no library-specific hardcoding).
-- **Search/replace**: `src/search_replace.py` — robust search/replace block parsing and application tolerant of LLM formatting mistakes.
+- **Validators**: `src/validators.py` — `DockerValidator` (Spike simulator) and `SSHValidator` (real hardware).
+- **Prompts**: `src/prompts.py` — generic SSE→sse2rvv.h translation prompts (no library-specific hardcoding).  Includes critical rules for `sizeof(__m128i)` → 16-byte SSE semantic width.
+- **Search/replace**: `src/search_replace.py` — robust search/replace block parsing and application, tolerant of LLM formatting mistakes (trailing whitespace, markdown fences, fuzzy whitespace matching).
+- **Benchmark**: `src/benchmark.py` — runs original SSE code on Intel and translated RVV code on RISC-V, compares outputs.
+- **Check**: `src/check.py` — standalone validation tool for output directories.
 - **Reference material**: `docs/riscv-reference/reference.md` is the authoritative RVV reference for LLM prompts.
 
 ## Testing
