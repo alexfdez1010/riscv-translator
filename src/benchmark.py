@@ -124,8 +124,12 @@ def run_on_host(
 
 
 def normalize_output(raw: str) -> str:
-    """Normalize alignment output for comparison: strip trailing whitespace per line, skip empty lines."""
+    """Normalize alignment output for comparison: strip trailing whitespace per line, skip empty lines,
+    and remove CPU time measurements (which naturally differ between platforms)."""
+    import re
     lines = [line.rstrip() for line in raw.strip().splitlines()]
+    # Remove CPU time suffixes like "CPU time: 0.074732 seconds"
+    lines = [re.sub(r'CPU time:\s*[\d.]+\s*seconds', '', line).rstrip() for line in lines]
     return "\n".join(line for line in lines if line)
 
 

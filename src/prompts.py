@@ -43,41 +43,49 @@ On RISC-V, `__m128i` maps to a *scalable* vector type (`vint32m1_t`) whose
 size depends on the hardware vector length (VLEN).  The compiler will reject
 `sizeof(__m128i)` and pointer arithmetic like `ptr + i` on `__m128i*`.
 
-**Do NOT hardcode `16` or any fixed byte size.**  The code must work on
-hardware with any VLEN (128, 256, 512, …).
+### The 16-byte rule
 
-### Step 1: Add a runtime size helper
+Even though the hardware register may be wider than 128 bits (e.g. VLEN=256
+means 32-byte registers), sse2rvv.h intrinsics always operate on exactly
+**16 bytes** of data (the SSE semantic width).  `_mm_load_si128` loads 16
+bytes, `_mm_store_si128` stores 16 bytes, and all arithmetic intrinsics
+(`_mm_add_*`, `_mm_max_*`, etc.) process exactly 16/8/4/2 elements within
+the first 16 bytes.
 
-sse2rvv.h does NOT provide this helper — you must add it to the translated
-source file (near the top, after the `#include "sse2rvv.h"` line):
+Therefore, **always use the constant `16` wherever the original code uses
+`sizeof(__m128i)`**.  Do NOT use a runtime VLEN query — the semantic width
+is always 16 bytes regardless of hardware VLEN.
+
+### Replacing sizeof(__m128i)
+
+- **Allocation**:  `malloc(n * 16)` instead of `malloc(n * sizeof(__m128i))`.
+- **calloc**: `calloc(n, 16)` instead of `calloc(n, sizeof(__m128i))`.
+- **Pointer arithmetic**:  cast to `uint8_t*` and offset by `i * 16`
+  instead of `ptr[i]` or `ptr + i`.
+
+### CRITICAL: Always use _mm_load_si128 / _mm_store_si128
+
+Direct pointer dereference on `__m128i*` (e.g., `*ptr = v` or `v = *ptr`)
+reads/writes the **full hardware register** (which may be 32+ bytes on
+VLEN>128 hardware), corrupting adjacent memory or reading garbage.
+
+**Always** use the bounded intrinsics instead:
 
 ```c
-/* Runtime size (in bytes) of one RVV vector register (LMUL=1). */
-static inline size_t __sse2rvv_vtype_size(void) {{
-    size_t vlenb;
-    __asm__ __volatile__("csrr %0, vlenb" : "=r"(vlenb));
-    return vlenb;
-}}
-#define SSE2RVV_VTYPE_SIZE __sse2rvv_vtype_size()
+// WRONG — writes full register (may be 32+ bytes), corrupts memory:
+*(__m128i*)((uint8_t*)pvHStore + j * 16) = vH;
+// CORRECT — writes exactly 16 bytes:
+_mm_store_si128((__m128i*)((uint8_t*)pvHStore + j * 16), vH);
+
+// WRONG — reads full register (may include garbage from adjacent slots):
+vH = *(__m128i*)((uint8_t*)pvHStore + j * 16);
+// CORRECT — reads exactly 16 bytes:
+vH = _mm_load_si128((__m128i*)((uint8_t*)pvHStore + j * 16));
 ```
 
-### Step 2: Use SSE2RVV_VTYPE_SIZE everywhere
-
-Use it as a drop-in replacement for `sizeof(__m128i)`:
-
-- **Allocation**:  `malloc(n * SSE2RVV_VTYPE_SIZE)` instead of
-  `malloc(n * sizeof(__m128i))`.
-- **Pointer arithmetic**:  cast to `uint8_t*` and offset by
-  `i * SSE2RVV_VTYPE_SIZE` instead of `ptr[i]` or `ptr + i`.
-  Example:
-  ```c
-  // WRONG — compiler error or hardcoded size:
-  __m128i v = pvHStore[j];
-  // CORRECT — VLEN-independent:
-  __m128i v = *(__m128i*)((uint8_t*)pvHStore + (size_t)j * SSE2RVV_VTYPE_SIZE);
-  ```
-- **calloc**: `calloc(n, SSE2RVV_VTYPE_SIZE)` instead of
-  `calloc(n, sizeof(__m128i))`.
+This applies to ALL vector memory access — array indexing, assignment,
+copies between arrays, etc.  Every `__m128i` load must go through
+`_mm_load_si128` and every store through `_mm_store_si128`.
 
 ## Translation strategy
 

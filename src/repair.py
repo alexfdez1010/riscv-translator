@@ -356,7 +356,20 @@ class TranslationAgent:
                 "alignment results than the original Intel SSE code.\n\n"
                 f"{details}\n\n"
                 "The SIMD translation has a bug that causes incorrect computation. "
-                "Fix the translated code so it produces the same output as the original."
+                "Do NOT change the algorithm — the bug is in how SIMD data is "
+                "accessed in memory.\n\n"
+                "LIKELY ROOT CAUSES (check and fix ALL of these):\n"
+                "1. Direct __m128i pointer dereference (`*ptr = v` or `v = *ptr`) "
+                "reads/writes the full hardware register (32+ bytes on VLEN>128), "
+                "corrupting adjacent memory. Replace ALL direct dereferences with "
+                "`_mm_store_si128(ptr, v)` and `v = _mm_load_si128(ptr)`.\n"
+                "2. Using SSE2RVV_VTYPE_SIZE or vlenb for allocation/pointer "
+                "arithmetic instead of the constant 16. SSE intrinsics always "
+                "operate on exactly 16 bytes regardless of hardware VLEN. Use 16 "
+                "for all sizeof(__m128i) replacements.\n"
+                "3. Profile/scoring arrays written sequentially with byte pointer "
+                "(stride=16) but read with SSE2RVV_VTYPE_SIZE stride — data "
+                "misalignment. Ensure both write and read use 16-byte stride."
             ),
         )
 

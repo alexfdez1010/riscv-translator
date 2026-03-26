@@ -3192,7 +3192,7 @@ FORCE_INLINE void _mm_store_sd(double *mem_addr, __m128d a) {
 }
 
 FORCE_INLINE void _mm_store_si128(__m128i *mem_addr, __m128i a) {
-  *mem_addr = a;
+  __riscv_vse32_v_i32m1((int32_t *)mem_addr, a, 4);
 }
 
 FORCE_INLINE void _mm_store_ss(float *mem_addr, __m128 a) {
