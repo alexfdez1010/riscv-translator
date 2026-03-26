@@ -211,14 +211,14 @@ def benchmark(
 
     # Run original on Intel (jump) — compile with gcc (x86)
     logger.info("Running original code on Intel (%s) ...", jump_host)
-    intel_compile = "gcc -O2 -o ssw_test main.c ssw.c -lm -lz 2>&1"
+    intel_compile = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
     intel_result = run_on_host(
         jump_host, jump_remote, intel_compile, run_cmd, "Intel (original SSE)",
     )
 
     # Run translated on RISC-V (final)
     logger.info("Running translated code on RISC-V (%s) ...", final_host)
-    riscv_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm -lz 2>&1"
+    riscv_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
     riscv_result = run_on_host(
         final_host, final_remote, riscv_compile, run_cmd, "RISC-V (translated RVV)",
     )

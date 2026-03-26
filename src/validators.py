@@ -197,6 +197,13 @@ class SSHValidator:
         for local_path in local_paths:
             if not local_path.exists():
                 continue
+            if local_path.is_dir():
+                # Remove existing remote directory first to avoid nesting
+                subprocess.run(
+                    ["ssh", self.ssh_host, f"rm -rf {self.remote_dir}/{local_path.name}"],
+                    capture_output=True,
+                    timeout=30,
+                )
             cmd = ["scp"]
             if local_path.is_dir():
                 cmd.append("-r")

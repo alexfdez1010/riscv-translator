@@ -219,7 +219,7 @@ def _to_messages(raw: list[dict[str, str]]) -> list[Message]:
 
 def default_ssh_compile_command() -> str:
     """Default compile command for real RISC-V hardware via SSH."""
-    return f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm -lz 2>&1"
+    return f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
 
 
 def default_ssh_run_command() -> str:
@@ -227,36 +227,20 @@ def default_ssh_run_command() -> str:
     return "./ssw_test demo/10k.fa demo/54mer_hap1_1.100.fa 2>&1"
 
 
-def _build_zlib_command() -> str:
-    """Shell snippet to cross-compile zlib for RISC-V from sources in the Docker image."""
-    return (
-        'ZLIB_SRC=/home/riscv_srcs/riscv-gnu-toolchain/gcc/zlib && '
-        f'cd $ZLIB_SRC && CC={RISCVCC} CFLAGS="-march=rv64gcv -mabi=lp64d -O2" '
-        './configure --host=riscv64-unknown-elf --prefix=/tmp/zlib-rv >/dev/null 2>&1 && '
-        'make -j$(nproc) >/dev/null 2>&1 && '
-        'mkdir -p /tmp/zlib-rv/include /tmp/zlib-rv/lib && '
-        'cp $ZLIB_SRC/zlib.h $ZLIB_SRC/zconf.h /tmp/zlib-rv/include/ && '
-        'cp $ZLIB_SRC/libz.a /tmp/zlib-rv/lib/ && '
-        'cd /workspace'
-    )
-
-
 def default_build_command(target_file: str) -> str:
     """Generate a default build + run command for sse2rvv translation.
 
-    Cross-compiles zlib for RISC-V (from sources in the Docker image), then
-    compiles main.c and ssw.c into ssw_test, links with -lm -lz, and
+    Compiles main.c and ssw.c into ssw_test, links with -lm, and
     runs it under QEMU with the demo datasets.  Callers can override via
     --build-command.
     """
-    cflags = "-O2 -I. -I/tmp/zlib-rv/include -march=rv64gcv -mabi=lp64d"
-    ldflags = "-L/tmp/zlib-rv/lib -lm -lz"
+    cflags = "-O2 -I. -march=rv64gcv -mabi=lp64d"
+    ldflags = "-lm"
     return (
-        f'echo "=== Building zlib for RISC-V ===" && '
-        f'{_build_zlib_command()} && '
         f'echo "=== Compiling ===" && '
         f'{RISCVCC} {cflags} main.c ssw.c -o ssw_test {ldflags} 2>&1 && '
         f'echo "=== Compilation succeeded, running under QEMU ===" && '
+        f'ls demo/ 2>&1 && '
         f'{SIMULATOR} ./ssw_test demo/10k.fa demo/54mer_hap1_1.100.fa 2>&1 && '
         f'echo "=== Execution succeeded ==="'
     )
@@ -310,7 +294,7 @@ class TranslationAgent:
             return None
 
         run_cmd = f"./ssw_test demo/{CORRECTNESS_DATASET} demo/{BENCH_REFERENCE_FILE} 2>&1"
-        compile_cmd = "gcc -O2 -o ssw_test main.c ssw.c -lm -lz 2>&1"
+        compile_cmd = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
 
         result = run_on_host(jump_host, jump_remote, compile_cmd, run_cmd, "Intel reference")
         if not result.ok:
@@ -344,7 +328,7 @@ class TranslationAgent:
             return None
 
         run_cmd = f"./ssw_test demo/{CORRECTNESS_DATASET} demo/{BENCH_REFERENCE_FILE} 2>&1"
-        compile_cmd = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm -lz 2>&1"
+        compile_cmd = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
 
         riscv_result = run_on_host(final_host, final_remote, compile_cmd, run_cmd, "RISC-V correctness")
         if not riscv_result.ok:

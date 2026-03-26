@@ -51,7 +51,7 @@ DATASETS_DIR = Path(os.getenv("DATASETS_DIR", str(PROJECT_DIR / "datasets")))
 VLEN = int(os.getenv("VLEN", "128"))
 SIMULATOR = os.getenv(
     "SIMULATOR",
-    f"qemu-riscv64 -cpu rv64,v=on,vext_spec=v1.0,vlen={VLEN},rvv_ta_all_1s=on",
+    f"spike --isa=rv64gcv pk64",
 )
 
 # ---------------------------------------------------------------------------

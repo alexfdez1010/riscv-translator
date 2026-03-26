@@ -53,7 +53,7 @@ def _mock_ssh_validator_init(monkeypatch):
 
 
 def _patch_infra(monkeypatch, tmp_path, *, docker_ok=False):
-    """Patch workspace creation and Docker validator for unit tests."""
+    """Patch workspace creation and Docker/SSH validators for unit tests."""
     monkeypatch.setattr(
         repair,
         "create_workspace",
@@ -70,6 +70,17 @@ def _patch_infra(monkeypatch, tmp_path, *, docker_ok=False):
             "",
             "" if docker_ok else "error: broken",
         ),
+    )
+    # Disable SSH validation and correctness checking in unit tests
+    monkeypatch.setattr(
+        repair.SSHValidator,
+        "_check_ssh",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        repair.TranslationAgent,
+        "_get_intel_reference",
+        lambda self, source_dir, test_data_dir: None,
     )
 
 
