@@ -1,4 +1,7 @@
-"""Benchmark: run original SSE code on Intel (jump) and translated RVV code on RISC-V (final).
+"""Benchmark: run original SSE code on Intel and translated RVV code on RISC-V.
+
+When SSH_JUMP_HOST is set, the Intel reference runs on that remote host.
+When SSH_JUMP_HOST is unset (default), the Intel reference runs locally.
 
 Validates that both produce identical alignment output, then compares execution time.
 
@@ -7,7 +10,9 @@ Usage:
 """
 
 import argparse
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,6 +128,66 @@ def run_on_host(
     )
 
 
+def run_locally(
+    work_dir: Path,
+    compile_cmd: str,
+    run_cmd: str,
+    label: str,
+) -> BenchmarkResult:
+    """Compile and run locally, measuring execution time."""
+    # Compile
+    comp = subprocess.run(
+        compile_cmd, shell=True, cwd=work_dir,
+        capture_output=True, timeout=120, text=True,
+    )
+    if comp.returncode != 0:
+        logger.error("[%s] Compilation failed:\n%s\n%s", label, comp.stdout, comp.stderr)
+        return BenchmarkResult(
+            host="localhost", label=label, ok=False, elapsed_seconds=0,
+            stdout=comp.stdout, stderr=comp.stderr,
+        )
+
+    # Run with timing
+    start = time.monotonic()
+    run = subprocess.run(
+        run_cmd, shell=True, cwd=work_dir,
+        capture_output=True, timeout=600, text=True,
+    )
+    elapsed = time.monotonic() - start
+
+    ok = run.returncode == 0
+    if not ok:
+        logger.error("[%s] Execution failed (rc=%d):\n%s\n%s", label, run.returncode, run.stdout, run.stderr)
+
+    return BenchmarkResult(
+        host="localhost", label=label, ok=ok, elapsed_seconds=elapsed,
+        stdout=run.stdout, stderr=run.stderr,
+    )
+
+
+def prepare_local_dir(
+    original_dir: Path,
+    dataset_dir: Path,
+    dataset: str,
+) -> Path:
+    """Copy original source and dataset files into a temporary directory."""
+    tmp = Path(tempfile.mkdtemp(prefix="bench-intel-"))
+    # Copy source files
+    for p in original_dir.iterdir():
+        if p.is_file():
+            shutil.copy2(p, tmp / p.name)
+    # Create demo/ subdirectory with datasets
+    demo = tmp / "demo"
+    demo.mkdir()
+    for fname in [dataset, REFERENCE_FILE]:
+        src = dataset_dir / fname
+        if src.exists():
+            shutil.copy2(src, demo / fname)
+        else:
+            logger.error("Dataset file not found: %s", src)
+    return tmp
+
+
 def normalize_output(raw: str) -> str:
     """Normalize alignment output for comparison: strip trailing whitespace per line, skip empty lines,
     and remove CPU time measurements (which naturally differ between platforms)."""
@@ -174,35 +239,58 @@ def benchmark(
     dataset_dir: Path = DATASETS_DIR,
 ) -> int:
     """Run benchmark comparing original SSE code on Intel vs translated RVV code on RISC-V."""
+    run_intel_locally = not SSH_JUMP_HOST
     jump_host = SSH_JUMP_HOST
     final_host = SSH_HOST
-    jump_remote = f"{REMOTE_DIR}-bench-original"
     final_remote = f"{REMOTE_DIR}-bench-translated"
 
     logger.info("Benchmark dataset: %s", dataset)
-    logger.info("Original code: %s -> %s (Intel)", original_dir, jump_host)
+    if run_intel_locally:
+        logger.info("Original code: %s -> localhost (Intel, local)", original_dir)
+    else:
+        logger.info("Original code: %s -> %s (Intel, SSH)", original_dir, jump_host)
     logger.info("Translated code: %s -> %s (RISC-V)", translated_dir, final_host)
 
-    # Check connectivity
-    if not check_ssh(jump_host):
-        logger.error("Cannot reach jump host: %s", jump_host)
-        return 1
-    logger.info("SSH to %s: OK", jump_host)
+    # Check connectivity for remote hosts
+    if not run_intel_locally:
+        if not check_ssh(jump_host):
+            logger.error("Cannot reach jump host: %s", jump_host)
+            return 1
+        logger.info("SSH to %s: OK", jump_host)
 
     if not check_ssh(final_host):
         logger.error("Cannot reach final host: %s", final_host)
         return 1
     logger.info("SSH to %s: OK", final_host)
 
-    # Upload original code to jump (Intel)
-    original_files = [p for p in original_dir.iterdir() if p.is_file()]
-    logger.info("Uploading original code to %s:%s ...", jump_host, jump_remote)
-    if not upload_to_host(jump_host, jump_remote, original_files):
-        return 1
-    if not upload_datasets(jump_host, jump_remote, dataset_dir, dataset):
-        return 1
+    run_cmd_suffix = f"./ssw_test demo/{dataset} demo/{REFERENCE_FILE} 2>&1"
 
-    # Upload translated code to final (RISC-V)
+    # --- Intel (original SSE) ---
+    intel_compile = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
+
+    if run_intel_locally:
+        logger.info("Running original code locally (Intel) ...")
+        local_dir = prepare_local_dir(original_dir, dataset_dir, dataset)
+        try:
+            intel_result = run_locally(
+                local_dir, intel_compile, run_cmd_suffix, "Intel (original SSE)",
+            )
+        finally:
+            shutil.rmtree(local_dir, ignore_errors=True)
+    else:
+        jump_remote = f"{REMOTE_DIR}-bench-original"
+        original_files = [p for p in original_dir.iterdir() if p.is_file()]
+        logger.info("Uploading original code to %s:%s ...", jump_host, jump_remote)
+        if not upload_to_host(jump_host, jump_remote, original_files):
+            return 1
+        if not upload_datasets(jump_host, jump_remote, dataset_dir, dataset):
+            return 1
+        logger.info("Running original code on Intel (%s) ...", jump_host)
+        intel_result = run_on_host(
+            jump_host, jump_remote, intel_compile, run_cmd_suffix, "Intel (original SSE)",
+        )
+
+    # --- RISC-V (translated RVV) ---
     translated_files = [p for p in translated_dir.iterdir() if p.is_file()]
     translated_dirs = [p for p in translated_dir.iterdir() if p.is_dir()]
     logger.info("Uploading translated code to %s:%s ...", final_host, final_remote)
@@ -211,20 +299,10 @@ def benchmark(
     if not upload_datasets(final_host, final_remote, dataset_dir, dataset):
         return 1
 
-    run_cmd = f"./ssw_test demo/{dataset} demo/{REFERENCE_FILE} 2>&1"
-
-    # Run original on Intel (jump) — compile with gcc (x86)
-    logger.info("Running original code on Intel (%s) ...", jump_host)
-    intel_compile = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
-    intel_result = run_on_host(
-        jump_host, jump_remote, intel_compile, run_cmd, "Intel (original SSE)",
-    )
-
-    # Run translated on RISC-V (final)
     logger.info("Running translated code on RISC-V (%s) ...", final_host)
     riscv_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
     riscv_result = run_on_host(
-        final_host, final_remote, riscv_compile, run_cmd, "RISC-V (translated RVV)",
+        final_host, final_remote, riscv_compile, run_cmd_suffix, "RISC-V (translated RVV)",
     )
 
     # Report

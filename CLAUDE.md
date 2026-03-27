@@ -73,7 +73,7 @@ uv sync --dev    # install dev deps (pytest)
 | `make sync` | Install/update Python dependencies |
 | `make translate SOURCE_DIR=... TARGET_FILE=... OUTPUT_DIR=...` | Run translation pipeline |
 | `make check OUTPUT_DIR=...` | Validate a translation output directory |
-| `make benchmark BENCHMARK_DATASET=...` | Compare Intel vs RISC-V execution |
+| `make benchmark BENCHMARK_DATASET=...` | Compare Intel vs RISC-V execution (Intel runs locally unless `SSH_JUMP_HOST` is set) |
 | `make clean` | Remove build artifacts |
 
 ### Direct invocation

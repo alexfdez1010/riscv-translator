@@ -161,7 +161,7 @@ All settings are in `src/config.py` and overridable via environment variables. S
 | `VLEN` | `128` | RISC-V vector register width (bits) |
 | `SIMULATOR` | `spike --isa=rv64gcv pk64` | RISC-V ISA simulator command |
 | `SSH_HOST` | `final` | SSH host for real RISC-V hardware validation |
-| `SSH_JUMP_HOST` | `jump` | SSH jump host (for Intel reference runs) |
+| `SSH_JUMP_HOST` | *(unset)* | SSH jump host for Intel reference runs. When unset, benchmark runs Intel locally |
 | `REMOTE_DIR` | `/tmp/sse2rvv` | Working directory on remote hosts |
 | `REACT_MAX_STEPS` | `15` | Max LLM repair iterations |
 | `LLM_VALIDATION_RETRIES` | `2` | Retries per LLM step on edit/parse failure |
