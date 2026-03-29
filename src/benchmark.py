@@ -115,7 +115,7 @@ def run_on_host(
     start = time.monotonic()
     run = subprocess.run(
         ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
-        capture_output=True, timeout=600, text=True,
+        capture_output=True, timeout=60 * 60 * 24, text=True,
     )
     elapsed = time.monotonic() - start
 
