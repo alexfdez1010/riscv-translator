@@ -1,0 +1,36 @@
+[2026-03-29 10:42:27 CEST] [ INFO  ] benchmark                      | Benchmark dataset: 1M.fa
+[2026-03-29 10:42:27 CEST] [ INFO  ] benchmark                      | Original code: /Users/alejandro/Projects/riscv-translator/initial_code -> jump (Intel, SSH)
+[2026-03-29 10:42:27 CEST] [ INFO  ] benchmark                      | Translated code: /Users/alejandro/Projects/riscv-translator/translations/sequence-alignment -> final (RISC-V)
+[2026-03-29 10:42:27 CEST] [ INFO  ] benchmark                      | Naive code: /Users/alejandro/Projects/riscv-translator/naive/code -> final (RISC-V)
+[2026-03-29 10:42:28 CEST] [ INFO  ] benchmark                      | SSH to jump: OK
+[2026-03-29 10:42:30 CEST] [ INFO  ] benchmark                      | SSH to final: OK
+[2026-03-29 10:42:30 CEST] [ INFO  ] benchmark                      | Uploading original code to jump:/tmp/sse2rvv-bench-original ...
+[2026-03-29 10:42:39 CEST] [ INFO  ] benchmark                      | Running original code on Intel (jump) ...
+[2026-03-29 10:42:46 CEST] [ INFO  ] benchmark                      | Uploading naive code to final:/tmp/sse2rvv-bench-naive ...
+[2026-03-29 10:42:57 CEST] [ INFO  ] benchmark                      | Running naive code on RISC-V (final) ...
+[2026-03-29 10:58:17 CEST] [ INFO  ] benchmark                      | Uploading translated code to final:/tmp/sse2rvv-bench-translated ...
+[2026-03-29 10:58:35 CEST] [ INFO  ] benchmark                      | Running translated code on RISC-V (final) ...
+
+============================================================
+BENCHMARK RESULTS
+============================================================
+Dataset: 1M.fa
+------------------------------------------------------------
+  Intel (original SSE)            PASS       4.93s  (jump)
+  RISC-V (naive)                  PASS     917.11s  (final)
+  RISC-V (translated RVV)         PASS      33.81s  (final)
+------------------------------------------------------------
+
+Output comparison (Intel vs RISC-V (naive)): MATCH
+Outputs match: 100 alignment records compared. (suboptimal_alignment_score ignored)
+
+Output comparison (Intel vs RISC-V (translated RVV)): MATCH
+Outputs match: 100 alignment records compared. (suboptimal_alignment_score ignored)
+
+RISC-V (naive) / Intel time ratio: 186.07x
+
+RISC-V (translated RVV) / Intel time ratio: 6.86x
+
+RVV speedup over naive: 27.12x
+
+Benchmark PASSED: all implementations produce identical output.

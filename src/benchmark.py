@@ -341,6 +341,29 @@ def compare_outputs(
     return False, "\n".join(details)
 
 
+def _run_riscv_entry(
+    label: str,
+    source_dir: Path,
+    final_host: str,
+    remote_dir: str,
+    dataset_dir: Path,
+    dataset: str,
+    run_cmd_suffix: str,
+) -> BenchmarkResult | None:
+    """Upload, compile and run one RISC-V implementation."""
+    src_files = [p for p in source_dir.iterdir() if p.is_file()]
+    src_dirs = [p for p in source_dir.iterdir() if p.is_dir()]
+    logger.info("Uploading %s to %s:%s ...", label, final_host, remote_dir)
+    if not upload_to_host(final_host, remote_dir, src_files + src_dirs):
+        return None
+    if not upload_datasets(final_host, remote_dir, dataset_dir, dataset):
+        return None
+
+    logger.info("Running %s on RISC-V (%s) ...", label, final_host)
+    compile_cmd = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
+    return run_on_host(final_host, remote_dir, compile_cmd, run_cmd_suffix, label)
+
+
 def benchmark(
     dataset: str = DEFAULT_DATASET,
     original_dir: Path = DEFAULT_ORIGINAL_DIR,
@@ -348,12 +371,16 @@ def benchmark(
     naive_dir: Path | None = DEFAULT_NAIVE_DIR,
     dataset_dir: Path = DATASETS_DIR,
     strict_suboptimal: bool = False,
+    rivals: list[tuple[str, Path]] | None = None,
 ) -> int:
-    """Run benchmark comparing original SSE code on Intel vs translated RVV code on RISC-V.
+    """Run benchmark comparing implementations.
 
     When *naive_dir* is provided, the naive RISC-V implementation is also
     compiled and run on the RISC-V host and included in the comparison.
     Pass ``None`` to skip the naive run.
+
+    *rivals* is an optional list of ``(label, path)`` pairs for additional
+    RISC-V implementations to include in the comparison.
     """
     run_intel_locally = not SSH_JUMP_HOST
     jump_host = SSH_JUMP_HOST
@@ -368,6 +395,8 @@ def benchmark(
     logger.info("Translated code: %s -> %s (RISC-V)", translated_dir, final_host)
     if naive_dir:
         logger.info("Naive code: %s -> %s (RISC-V)", naive_dir, final_host)
+    for label, path in (rivals or []):
+        logger.info("Rival %s: %s -> %s (RISC-V)", label, path, final_host)
 
     # Check connectivity for remote hosts
     if not run_intel_locally:
@@ -411,41 +440,39 @@ def benchmark(
     # --- RISC-V (naive implementation) ---
     naive_result = None
     if naive_dir:
-        naive_remote = f"{REMOTE_DIR}-bench-naive"
-        naive_files = [p for p in naive_dir.iterdir() if p.is_file()]
-        naive_dirs = [p for p in naive_dir.iterdir() if p.is_dir()]
-        logger.info("Uploading naive code to %s:%s ...", final_host, naive_remote)
-        if not upload_to_host(final_host, naive_remote, naive_files + naive_dirs):
-            return 1
-        if not upload_datasets(final_host, naive_remote, dataset_dir, dataset):
-            return 1
-
-        logger.info("Running naive code on RISC-V (%s) ...", final_host)
-        naive_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
-        naive_result = run_on_host(
-            final_host, naive_remote, naive_compile, run_cmd_suffix, "RISC-V (naive)",
+        naive_result = _run_riscv_entry(
+            "RISC-V (naive)", naive_dir, final_host,
+            f"{REMOTE_DIR}-bench-naive", dataset_dir, dataset, run_cmd_suffix,
         )
+        if naive_result is None:
+            return 1
 
     # --- RISC-V (translated RVV) ---
-    translated_files = [p for p in translated_dir.iterdir() if p.is_file()]
-    translated_dirs = [p for p in translated_dir.iterdir() if p.is_dir()]
-    logger.info("Uploading translated code to %s:%s ...", final_host, final_remote)
-    if not upload_to_host(final_host, final_remote, translated_files + translated_dirs):
-        return 1
-    if not upload_datasets(final_host, final_remote, dataset_dir, dataset):
+    riscv_result = _run_riscv_entry(
+        "RISC-V (translated RVV)", translated_dir, final_host,
+        final_remote, dataset_dir, dataset, run_cmd_suffix,
+    )
+    if riscv_result is None:
         return 1
 
-    logger.info("Running translated code on RISC-V (%s) ...", final_host)
-    riscv_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
-    riscv_result = run_on_host(
-        final_host, final_remote, riscv_compile, run_cmd_suffix, "RISC-V (translated RVV)",
-    )
+    # --- RISC-V (rivals) ---
+    rival_results: list[BenchmarkResult] = []
+    for idx, (label, path) in enumerate(rivals or []):
+        rival_remote = f"{REMOTE_DIR}-bench-rival-{idx}"
+        result = _run_riscv_entry(
+            label, path, final_host,
+            rival_remote, dataset_dir, dataset, run_cmd_suffix,
+        )
+        if result is None:
+            return 1
+        rival_results.append(result)
 
     # Report
     all_results = [intel_result]
     if naive_result:
         all_results.append(naive_result)
     all_results.append(riscv_result)
+    all_results.extend(rival_results)
 
     print("\n" + "=" * 60)
     print("BENCHMARK RESULTS")
@@ -478,7 +505,7 @@ def benchmark(
         if not match:
             all_match = False
 
-    # Timing comparison
+    # Timing comparison vs Intel
     if intel_result.elapsed_seconds > 0:
         for r in all_results[1:]:
             ratio = r.elapsed_seconds / intel_result.elapsed_seconds
@@ -488,12 +515,31 @@ def benchmark(
         speedup = naive_result.elapsed_seconds / riscv_result.elapsed_seconds
         print(f"\nRVV speedup over naive: {speedup:.2f}x")
 
+    # Cross-comparison between RISC-V implementations
+    riscv_entries = [r for r in all_results[1:] if r.ok]
+    if len(riscv_entries) >= 2:
+        ref = riscv_entries[0]
+        print(f"\n--- RISC-V cross-comparison (reference: {ref.label}) ---")
+        for r in riscv_entries[1:]:
+            if ref.elapsed_seconds > 0:
+                ratio = r.elapsed_seconds / ref.elapsed_seconds
+                print(f"  {r.label:30s}  {ratio:.3f}x  ({r.elapsed_seconds:.2f}s vs {ref.elapsed_seconds:.2f}s)")
+
     if all_match:
         print("\nBenchmark PASSED: all implementations produce identical output.")
     else:
         print("\nBenchmark FINISHED: some outputs differ (see above).")
     return 0
-    return 0
+
+
+def _parse_rival(value: str) -> tuple[str, Path]:
+    """Parse a ``LABEL:PATH`` rival specification."""
+    if ":" in value:
+        label, path_str = value.split(":", 1)
+        return label.strip(), Path(path_str.strip())
+    # No label — derive from directory name
+    p = Path(value)
+    return f"RISC-V ({p.name})", p
 
 
 def parse_args() -> argparse.Namespace:
@@ -530,6 +576,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip the naive RISC-V implementation benchmark",
     )
     parser.add_argument(
+        "--rival",
+        action="append",
+        default=[],
+        metavar="LABEL:PATH",
+        help="Additional RISC-V implementation to compare (repeatable). "
+             "Format: 'My Label:path/to/dir' or just 'path/to/dir'",
+    )
+    parser.add_argument(
         "--dataset-dir",
         type=Path,
         default=DATASETS_DIR,
@@ -548,6 +602,7 @@ def main() -> int:
     configure_logging(level="INFO")
     args = parse_args()
     naive = None if args.no_naive else args.naive_dir
+    rivals = [_parse_rival(r) for r in args.rival]
     return benchmark(
         dataset=args.dataset,
         original_dir=args.original_dir,
@@ -555,6 +610,7 @@ def main() -> int:
         naive_dir=naive,
         dataset_dir=args.dataset_dir,
         strict_suboptimal=args.strict_suboptimal,
+        rivals=rivals,
     )
 
 

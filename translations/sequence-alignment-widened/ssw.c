@@ -1,0 +1,1103 @@
+/* The MIT License
+
+   Copyright (c) 2012-2015 Boston College.
+
+   Permission is hereby granted, free of charge, to any person obtaining
+   a copy of this software and associated documentation files (the
+   "Software"), to deal in the Software without restriction, including
+   without limitation the rights to use, copy, modify, merge, publish,
+   distribute, sublicense, and/or sell copies of the Software, and to
+   permit persons to whom the Software is furnished to do so, subject to
+   the following conditions:
+
+   The above copyright notice and this permission notice shall be
+   included in all copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+*/
+
+/* The 2-clause BSD License
+
+   Copyright 2006 Michael Farrar.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are
+   met:
+
+   1. Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+   HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+   LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+   DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+   THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+/*
+ *  ssw.c
+ *
+ *  Created by Mengyao Zhao on 6/22/10.
+ *  Copyright 2010 Boston College. All rights reserved.
+ *	Version 1.2.6
+ *	Last revision by Mengyao Zhao on 2024-Jul-03.
+ *
+ *  The lazy-F loop implementation was derived from SWPS3, which is
+ *  MIT licensed under ETH Zürich, Institute of Computational Science.
+ *
+ *  The core SW loop referenced the swsse2 implementation, which is
+ *  BSD licensed under Micharl Farrar.
+ *
+ *  RVV-WIDENED: Rewritten to use native RISC-V Vector intrinsics with
+ *  runtime VLEN instead of fixed 128-bit SSE emulation via sse2rvv.h.
+ *  The code is VLEN-agnostic and works correctly at any VLEN >= 128.
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <riscv_vector.h>
+#include "ssw.h"
+
+
+#ifdef __GNUC__
+#define LIKELY(x) __builtin_expect((x),1)
+#define UNLIKELY(x) __builtin_expect((x),0)
+#else
+#define LIKELY(x) (x)
+#define UNLIKELY(x) (x)
+#endif
+
+/* Convert the coordinate in the scoring matrix into the coordinate in one line of the band. */
+#define set_u(u, w, i, j) { int x=(i)-(w); x=x>0?x:0; (u)=(j)-x+1; }
+
+/* Convert the coordinate in the direction matrix into the coordinate in one line of the band. */
+#define set_d(u, w, i, j, p) { int x=(i)-(w); x=x>0?x:0; x=(j)-x; (u)=x*3+p; }
+
+/*! @function
+  @abstract  Round an integer to the next closest power-2 integer.
+  @param  x  integer to be rounded (in place)
+  @discussion x will be modified.
+ */
+#define kroundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
+
+/* ---------- RVV helpers: runtime vector-length queries ---------- */
+
+/* Number of 8-bit lanes in one m1 register (= VLEN/8) */
+static inline size_t vlmax_e8(void) { return __riscv_vsetvlmax_e8m1(); }
+
+/* Number of 16-bit lanes in one m1 register (= VLEN/16) */
+static inline size_t vlmax_e16(void) { return __riscv_vsetvlmax_e16m1(); }
+
+/* Vector register size in bytes (= VLEN/8, same as vlmax_e8) */
+static inline size_t vregbytes(void) { return __riscv_vsetvlmax_e8m1(); }
+
+/* ---------------------------------------------------------------- */
+
+typedef struct {
+	uint16_t score;
+	int32_t ref;	 //0-based position
+	int32_t read;    //alignment ending position on read, 0-based
+} alignment_end;
+
+typedef struct {
+	uint32_t* seq;
+	int32_t length;
+} cigar;
+
+struct _profile{
+	uint8_t* profile_byte;	// 0: none  (raw bytes, VLEN-width vectors stored contiguously)
+	uint8_t* profile_word;	// 0: none
+	const int8_t* read;
+	const int8_t* mat;
+	int32_t readLen;
+	int32_t n;
+	uint8_t bias;
+};
+
+/* array index is an ASCII character value from a CIGAR,
+   element value is the corresponding integer opcode between 0 and 8 */
+const uint8_t encoded_ops[] = {
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0,         0,         0,         0,
+	0 /*   */, 0 /* ! */, 0 /* " */, 0 /* # */,
+	0 /* $ */, 0 /* % */, 0 /* & */, 0 /* ' */,
+	0 /* ( */, 0 /* ) */, 0 /* * */, 0 /* + */,
+	0 /* , */, 0 /* - */, 0 /* . */, 0 /* / */,
+	0 /* 0 */, 0 /* 1 */, 0 /* 2 */, 0 /* 3 */,
+	0 /* 4 */, 0 /* 5 */, 0 /* 6 */, 0 /* 7 */,
+	0 /* 8 */, 0 /* 9 */, 0 /* : */, 0 /* ; */,
+	0 /* < */, 7 /* = */, 0 /* > */, 0 /* ? */,
+	0 /* @ */, 0 /* A */, 0 /* B */, 0 /* C */,
+	2 /* D */, 0 /* E */, 0 /* F */, 0 /* G */,
+	5 /* H */, 1 /* I */, 0 /* J */, 0 /* K */,
+	0 /* L */, 0 /* M */, 3 /* N */, 0 /* O */,
+	6 /* P */, 0 /* Q */, 0 /* R */, 4 /* S */,
+	0 /* T */, 0 /* U */, 0 /* V */, 0 /* W */,
+	8 /* X */, 0 /* Y */, 0 /* Z */, 0 /* [ */,
+	0 /* \ */, 0 /* ] */, 0 /* ^ */, 0 /* _ */,
+	0 /* ` */, 0 /* a */, 0 /* b */, 0 /* c */,
+	0 /* d */, 0 /* e */, 0 /* f */, 0 /* g */,
+	0 /* h */, 0 /* i */, 0 /* j */, 0 /* k */,
+	0 /* l */, 0 /* m */, 0 /* n */, 0 /* o */,
+	0 /* p */, 0 /* q */, 0 /* r */, 0 /* s */,
+	0 /* t */, 0 /* u */, 0 /* v */, 0 /* w */,
+	0 /* x */, 0 /* y */, 0 /* z */, 0 /* { */,
+	0 /* | */, 0 /* } */, 0 /* ~ */, 0 /*  */
+};
+
+/* Generate query profile rearrange query sequence & calculate the weight of match/mismatch.
+   RVV-WIDENED: uses runtime vlmax_e8() instead of hardcoded 16. */
+static uint8_t* qP_byte (const int8_t* read_num,
+				  const int8_t* mat,
+				  const int32_t readLen,
+				  const int32_t n,	/* the edge length of the squre matrix mat */
+				  uint8_t bias) {
+
+	size_t lanes = vlmax_e8(); /* number of 8-bit lanes (was 16) */
+	int32_t segLen = (readLen + (int32_t)lanes - 1) / (int32_t)lanes;
+	uint8_t* vProfile = (uint8_t*)malloc(n * segLen * lanes);
+	int8_t* t = (int8_t*)vProfile;
+	int32_t nt, i, j;
+	size_t segNum;
+
+	for (nt = 0; LIKELY(nt < n); nt ++) {
+		for (i = 0; i < segLen; i ++) {
+			j = i;
+			for (segNum = 0; LIKELY(segNum < lanes) ; segNum ++) {
+				*t++ = j>= readLen ? bias : mat[nt * n + read_num[j]] + bias;
+				j += segLen;
+			}
+		}
+	}
+	return vProfile;
+}
+
+/* Striped Smith-Waterman (8-bit path)
+   RVV-WIDENED: native RVV intrinsics, VLEN-agnostic.
+   Record the highest score of each reference position.
+   Return the alignment score and ending position of the best alignment, 2nd best alignment, etc.
+ */
+static alignment_end* sw_rvv_byte (const int8_t* ref,
+							 int8_t ref_dir,	// 0: forward ref; 1: reverse ref
+							 int32_t refLen,
+							 int32_t readLen,
+							 const uint8_t weight_gapO, /* will be used as - */
+							 const uint8_t weight_gapE, /* will be used as - */
+							 const uint8_t* vProfile,
+							 uint8_t terminate,	/* the best alignment score: used to terminate
+												   the matrix calculation when locating the
+												   alignment beginning point. If this score
+												   is set to 0, it will not be used */
+	 						 uint8_t bias,  /* Shift 0 point to a positive value. */
+							 int32_t maskLen) {
+
+	size_t vl = vlmax_e8();       /* number of 8-bit lanes */
+	size_t vb = vl;               /* bytes per vector register (= vl for e8) */
+
+	uint8_t max = 0;		                     /* the max alignment score */
+	int32_t end_read = readLen - 1;
+	int32_t end_ref = -1; /* 0_based best alignment ending point; Initialized as isn't aligned -1. */
+	int32_t segLen = (readLen + (int32_t)vl - 1) / (int32_t)vl; /* number of segment */
+
+	/* array to record the largest score of each reference position */
+	uint8_t* maxColumn = (uint8_t*) calloc(refLen, 1);
+
+	/* array to record the alignment read ending position of the largest score of each reference position */
+	int32_t* end_read_column = (int32_t*) calloc(refLen, sizeof(int32_t));
+
+	/* Zero vector */
+	vuint8m1_t vZero = __riscv_vmv_v_x_u8m1(0, vl);
+
+	uint8_t* pvHStore = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvHLoad = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvE = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvHmax = (uint8_t*) calloc(segLen, vb);
+
+	int32_t i, j, k;
+	/* Insertion begin vector */
+	vuint8m1_t vGapO = __riscv_vmv_v_x_u8m1(weight_gapO, vl);
+
+	/* Insertion extension vector */
+	vuint8m1_t vGapE = __riscv_vmv_v_x_u8m1(weight_gapE, vl);
+
+	/* Bias vector */
+	vuint8m1_t vBias = __riscv_vmv_v_x_u8m1(bias, vl);
+
+	vuint8m1_t vMaxScore = vZero; /* Trace the highest score of the whole SW matrix. */
+	vuint8m1_t vMaxMark = vZero; /* Trace the highest score till the previous column. */
+	int32_t edge, begin = 0, end = refLen, step = 1;
+
+	/* outer loop to process the reference sequence */
+	if (ref_dir == 1) {
+		begin = refLen - 1;
+		end = -1;
+		step = -1;
+	}
+	for (i = begin; LIKELY(i != end); i += step) {
+		vuint8m1_t e, vF = vZero, vMaxColumn = vZero; /* Initialize F value to 0.
+							   Any errors to vH values will be corrected in the Lazy_F loop.
+							 */
+
+		vuint8m1_t vH = __riscv_vle8_v_u8m1(pvHStore + (segLen - 1) * vb, vl);
+		vH = __riscv_vslideup_vx_u8m1_tu(vZero, vH, 1, vl); /* Shift left by 1 byte, insert 0 at bottom. */
+		const uint8_t* vP = vProfile + ref[i] * segLen * vb; /* Right part of the vProfile */
+
+		/* Swap the 2 H buffers. */
+		uint8_t* pv = pvHLoad;
+		pvHLoad = pvHStore;
+		pvHStore = pv;
+
+		/* inner loop to process the query sequence */
+		for (j = 0; LIKELY(j < segLen); ++j) {
+			vH = __riscv_vsaddu_vv_u8m1(vH, __riscv_vle8_v_u8m1(vP + j * vb, vl), vl);
+			vH = __riscv_vssubu_vv_u8m1(vH, vBias, vl); /* vH will be always > 0 */
+
+			/* Get max from vH, vE and vF. */
+			e = __riscv_vle8_v_u8m1(pvE + j * vb, vl);
+			vH = __riscv_vmaxu_vv_u8m1(vH, e, vl);
+			vH = __riscv_vmaxu_vv_u8m1(vH, vF, vl);
+			vMaxColumn = __riscv_vmaxu_vv_u8m1(vMaxColumn, vH, vl);
+
+			/* Save vH values. */
+			__riscv_vse8_v_u8m1(pvHStore + j * vb, vH, vl);
+
+			/* Update vE value. */
+			vH = __riscv_vssubu_vv_u8m1(vH, vGapO, vl); /* saturation arithmetic, result >= 0 */
+			e = __riscv_vssubu_vv_u8m1(e, vGapE, vl);
+			e = __riscv_vmaxu_vv_u8m1(e, vH, vl);
+			__riscv_vse8_v_u8m1(pvE + j * vb, e, vl);
+
+			/* Update vF value. */
+			vF = __riscv_vssubu_vv_u8m1(vF, vGapE, vl);
+			vF = __riscv_vmaxu_vv_u8m1(vF, vH, vl);
+
+			/* Load the next vH. */
+			vH = __riscv_vle8_v_u8m1(pvHLoad + j * vb, vl);
+		}
+
+        /* Lazy_F loop: has been revised to disallow adjecent insertion and then deletion, so don't update E(i, j), learn from SWPS3 */
+		/* RVV-WIDENED: loop runs vl iterations instead of fixed 16 */
+		for (k = 0; LIKELY(k < (int32_t)vl); ++k) {
+			vF = __riscv_vslideup_vx_u8m1_tu(vZero, vF, 1, vl);
+			for (j = 0; LIKELY(j < segLen); ++j) {
+				vH = __riscv_vle8_v_u8m1(pvHStore + j * vb, vl);
+				vH = __riscv_vmaxu_vv_u8m1(vH, vF, vl);
+	    		vMaxColumn = __riscv_vmaxu_vv_u8m1(vMaxColumn, vH, vl);
+				__riscv_vse8_v_u8m1(pvHStore + j * vb, vH, vl);
+				vH = __riscv_vssubu_vv_u8m1(vH, vGapO, vl);
+				vF = __riscv_vssubu_vv_u8m1(vF, vGapE, vl);
+				/* Early exit: if all lanes have vF <= vH (i.e. sat_sub(vF,vH) == 0) */
+				{
+					vuint8m1_t vDiff = __riscv_vssubu_vv_u8m1(vF, vH, vl);
+					vbool8_t all_zero = __riscv_vmseq_vx_u8m1_b8(vDiff, 0, vl);
+					if (UNLIKELY(__riscv_vcpop_m_b8(all_zero, vl) == vl)) goto lazy_end;
+				}
+			}
+		}
+
+lazy_end:
+		vMaxScore = __riscv_vmaxu_vv_u8m1(vMaxScore, vMaxColumn, vl);
+		/* Check if the max score changed compared to the previous column */
+		{
+			vbool8_t eq_mask = __riscv_vmseq_vv_u8m1_b8(vMaxMark, vMaxScore, vl);
+			if (__riscv_vcpop_m_b8(eq_mask, vl) != vl) {
+				uint8_t temp;
+				vMaxMark = vMaxScore;
+				/* Horizontal reduction: find max across all lanes */
+				vuint8m1_t vReduce = __riscv_vredmaxu_vs_u8m1_u8m1(vMaxScore, vZero, vl);
+				temp = (uint8_t)__riscv_vmv_x_s_u8m1_u8(vReduce);
+
+				if (LIKELY(temp > max)) {
+					max = temp;
+					if (max + bias >= 255) break;	//overflow
+					end_ref = i;
+
+					/* Store the column with the highest alignment score in order to trace the alignment ending position on read. */
+					for (j = 0; LIKELY(j < segLen); ++j) {
+						vuint8m1_t tmp = __riscv_vle8_v_u8m1(pvHStore + j * vb, vl);
+						__riscv_vse8_v_u8m1(pvHmax + j * vb, tmp, vl);
+					}
+				}
+			}
+		}
+
+		/* Record the max score of current column. */
+		{
+			vuint8m1_t vReduce = __riscv_vredmaxu_vs_u8m1_u8m1(vMaxColumn, vZero, vl);
+			maxColumn[i] = (uint8_t)__riscv_vmv_x_s_u8m1_u8(vReduce);
+		}
+		if (maxColumn[i] == terminate) break;
+	}
+
+	/* Trace the alignment ending position on read. */
+	uint8_t *t = pvHmax;
+	int32_t column_len = segLen * (int32_t)vl;
+	for (i = 0; LIKELY(i < column_len); ++i, ++t) {
+		int32_t temp;
+		if (*t == max) {
+			temp = i / (int32_t)vl + i % (int32_t)vl * segLen;
+			if (temp < end_read) end_read = temp;
+		}
+	}
+
+	free(pvHmax);
+	free(pvE);
+	free(pvHLoad);
+	free(pvHStore);
+
+	/* Find the most possible 2nd best alignment. */
+	alignment_end* bests = (alignment_end*) calloc(2, sizeof(alignment_end));
+	bests[0].score = max + bias >= 255 ? 255 : max;
+	bests[0].ref = end_ref;
+	bests[0].read = end_read;
+
+	bests[1].score = 0;
+	bests[1].ref = 0;
+	bests[1].read = 0;
+
+	edge = (end_ref - maskLen) > 0 ? (end_ref - maskLen) : 0;
+	for (i = 0; i < edge; i ++) {
+		if (maxColumn[i] > bests[1].score) {
+			bests[1].score = maxColumn[i];
+			bests[1].ref = i;
+		}
+	}
+	edge = (end_ref + maskLen) > refLen ? refLen : (end_ref + maskLen);
+	for (i = edge + 1; i < refLen; i ++) {
+		if (maxColumn[i] > bests[1].score) {
+			bests[1].score = maxColumn[i];
+			bests[1].ref = i;
+		}
+	}
+
+	free(maxColumn);
+	free(end_read_column);
+	return bests;
+}
+
+/* Generate query profile for 16-bit (word) path.
+   RVV-WIDENED: uses runtime vlmax_e16() instead of hardcoded 8. */
+static uint8_t* qP_word (const int8_t* read_num,
+				  const int8_t* mat,
+				  const int32_t readLen,
+				  const int32_t n) {
+
+	size_t lanes = vlmax_e16(); /* number of 16-bit lanes (was 8) */
+	size_t vb = vregbytes();    /* bytes per vector register */
+	int32_t segLen = (readLen + (int32_t)lanes - 1) / (int32_t)lanes;
+	uint8_t* vProfile = (uint8_t*)malloc(n * segLen * vb);
+	int16_t* t = (int16_t*)vProfile;
+	int32_t nt, i, j;
+	size_t segNum;
+
+	/* Generate query profile rearrange query sequence & calculate the weight of match/mismatch */
+	for (nt = 0; LIKELY(nt < n); nt ++) {
+		for (i = 0; i < segLen; i ++) {
+			j = i;
+			for (segNum = 0; LIKELY(segNum < lanes) ; segNum ++) {
+				*t++ = j>= readLen ? 0 : mat[nt * n + read_num[j]];
+				j += segLen;
+			}
+		}
+	}
+	return vProfile;
+}
+
+/* Striped Smith-Waterman (16-bit path)
+   RVV-WIDENED: native RVV intrinsics, VLEN-agnostic. */
+static alignment_end* sw_rvv_word (const int8_t* ref,
+							 int8_t ref_dir,	// 0: forward ref; 1: reverse ref
+							 int32_t refLen,
+							 int32_t readLen,
+							 const uint8_t weight_gapO, /* will be used as - */
+							 const uint8_t weight_gapE, /* will be used as - */
+							 const uint8_t* vProfile,
+							 uint16_t terminate,
+							 int32_t maskLen) {
+
+	size_t vl = vlmax_e16();      /* number of 16-bit lanes */
+	size_t vb = vregbytes();      /* bytes per vector register */
+
+	uint16_t max = 0;		                     /* the max alignment score */
+	int32_t end_read = readLen - 1;
+	int32_t end_ref = 0; /* 1_based best alignment ending point; Initialized as isn't aligned - 0. */
+	int32_t segLen = (readLen + (int32_t)vl - 1) / (int32_t)vl; /* number of segment */
+
+	/* array to record the largest score of each reference position */
+	uint16_t* maxColumn = (uint16_t*) calloc(refLen, 2);
+
+	/* array to record the alignment read ending position of the largest score of each reference position */
+	int32_t* end_read_column = (int32_t*) calloc(refLen, sizeof(int32_t));
+
+	/* Zero vector */
+	vint16m1_t vZero = __riscv_vmv_v_x_i16m1(0, vl);
+
+	uint8_t* pvHStore = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvHLoad = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvE = (uint8_t*) calloc(segLen, vb);
+	uint8_t* pvHmax = (uint8_t*) calloc(segLen, vb);
+
+	int32_t i, j, k;
+	/* Insertion begin vector */
+	vuint16m1_t vGapO_u = __riscv_vmv_v_x_u16m1(weight_gapO, vl);
+
+	/* Insertion extension vector */
+	vuint16m1_t vGapE_u = __riscv_vmv_v_x_u16m1(weight_gapE, vl);
+
+	vint16m1_t vMaxScore = vZero; /* Trace the highest score of the whole SW matrix. */
+	vint16m1_t vMaxMark = vZero; /* Trace the highest score till the previous column. */
+	int32_t edge, begin = 0, end = refLen, step = 1;
+
+	/* outer loop to process the reference sequence */
+	if (ref_dir == 1) {
+		begin = refLen - 1;
+		end = -1;
+		step = -1;
+	}
+	for (i = begin; LIKELY(i != end); i += step) {
+		vint16m1_t e, vF = vZero; /* Initialize F value to 0.
+							   Any errors to vH values will be corrected in the Lazy_F loop.
+							 */
+		vint16m1_t vH = __riscv_vle16_v_i16m1((const int16_t*)(pvHStore + (segLen - 1) * vb), vl);
+		vH = __riscv_vslideup_vx_i16m1_tu(vZero, vH, 1, vl); /* Shift left by 1 element (2 bytes). */
+
+		/* Swap the 2 H buffers. */
+		uint8_t* pv = pvHLoad;
+
+		vint16m1_t vMaxColumn = vZero; /* vMaxColumn is used to record the max values of column i. */
+
+		const uint8_t* vP = vProfile + ref[i] * segLen * vb; /* Right part of the vProfile */
+		pvHLoad = pvHStore;
+		pvHStore = pv;
+
+		/* inner loop to process the query sequence */
+		for (j = 0; LIKELY(j < segLen); j ++) {
+			vH = __riscv_vsadd_vv_i16m1(vH, __riscv_vle16_v_i16m1((const int16_t*)(vP + j * vb), vl), vl);
+
+			/* Get max from vH, vE and vF. */
+			e = __riscv_vle16_v_i16m1((const int16_t*)(pvE + j * vb), vl);
+			vH = __riscv_vmax_vv_i16m1(vH, e, vl);
+			vH = __riscv_vmax_vv_i16m1(vH, vF, vl);
+			vMaxColumn = __riscv_vmax_vv_i16m1(vMaxColumn, vH, vl);
+
+			/* Save vH values. */
+			__riscv_vse16_v_i16m1((int16_t*)(pvHStore + j * vb), vH, vl);
+
+			/* Update vE value: unsigned saturating subtract for gap penalties,
+			   then signed max (matches original SSE semantics). */
+			{
+				vuint16m1_t vH_u = __riscv_vreinterpret_v_i16m1_u16m1(vH);
+				vuint16m1_t e_u = __riscv_vreinterpret_v_i16m1_u16m1(e);
+				vuint16m1_t vH_gap = __riscv_vssubu_vv_u16m1(vH_u, vGapO_u, vl);
+				e_u = __riscv_vssubu_vv_u16m1(e_u, vGapE_u, vl);
+				e = __riscv_vmax_vv_i16m1(__riscv_vreinterpret_v_u16m1_i16m1(e_u),
+				                          __riscv_vreinterpret_v_u16m1_i16m1(vH_gap), vl);
+			}
+			__riscv_vse16_v_i16m1((int16_t*)(pvE + j * vb), e, vl);
+
+			/* Update vF value. */
+			{
+				vuint16m1_t vF_u = __riscv_vreinterpret_v_i16m1_u16m1(vF);
+				vuint16m1_t vH_u = __riscv_vreinterpret_v_i16m1_u16m1(vH);
+				vF_u = __riscv_vssubu_vv_u16m1(vF_u, vGapE_u, vl);
+				vuint16m1_t vH_gap = __riscv_vssubu_vv_u16m1(vH_u, vGapO_u, vl);
+				vF = __riscv_vmax_vv_i16m1(__riscv_vreinterpret_v_u16m1_i16m1(vF_u),
+				                           __riscv_vreinterpret_v_u16m1_i16m1(vH_gap), vl);
+			}
+
+			/* Load the next vH. */
+			vH = __riscv_vle16_v_i16m1((const int16_t*)(pvHLoad + j * vb), vl);
+		}
+
+		/* Lazy_F loop: has been revised to disallow adjecent insertion and then deletion, so don't update E(i, j), learn from SWPS3 */
+		/* RVV-WIDENED: loop runs vl iterations instead of fixed 8 */
+		for (k = 0; LIKELY(k < (int32_t)vl); ++k) {
+			vF = __riscv_vslideup_vx_i16m1_tu(vZero, vF, 1, vl);
+			for (j = 0; LIKELY(j < segLen); ++j) {
+				vH = __riscv_vle16_v_i16m1((const int16_t*)(pvHStore + j * vb), vl);
+				vH = __riscv_vmax_vv_i16m1(vH, vF, vl);
+				vMaxColumn = __riscv_vmax_vv_i16m1(vMaxColumn, vH, vl);
+				__riscv_vse16_v_i16m1((int16_t*)(pvHStore + j * vb), vH, vl);
+				{
+					vuint16m1_t vH_u = __riscv_vreinterpret_v_i16m1_u16m1(vH);
+					vuint16m1_t vF_u = __riscv_vreinterpret_v_i16m1_u16m1(vF);
+					vuint16m1_t vH_gap = __riscv_vssubu_vv_u16m1(vH_u, vGapO_u, vl);
+					vF_u = __riscv_vssubu_vv_u16m1(vF_u, vGapE_u, vl);
+					vF = __riscv_vmax_vv_i16m1(__riscv_vreinterpret_v_u16m1_i16m1(vF_u),
+					                           __riscv_vreinterpret_v_u16m1_i16m1(vH_gap), vl);
+					/* Early exit: if no lane has vF > vH (signed comparison) */
+					vbool16_t gt_mask = __riscv_vmsgt_vv_i16m1_b16(vF, __riscv_vreinterpret_v_u16m1_i16m1(vH_gap), vl);
+					if (UNLIKELY(__riscv_vcpop_m_b16(gt_mask, vl) == 0)) goto word_lazy_end;
+				}
+			}
+		}
+
+word_lazy_end:
+		vMaxScore = __riscv_vmax_vv_i16m1(vMaxScore, vMaxColumn, vl);
+		/* Check if the max score changed */
+		{
+			vbool16_t eq_mask = __riscv_vmseq_vv_i16m1_b16(vMaxMark, vMaxScore, vl);
+			if (__riscv_vcpop_m_b16(eq_mask, vl) != vl) {
+				uint16_t temp;
+				vMaxMark = vMaxScore;
+				/* Horizontal reduction: find max across all 16-bit lanes */
+				vint16m1_t vReduce = __riscv_vredmax_vs_i16m1_i16m1(vMaxScore, vZero, vl);
+				temp = (uint16_t)__riscv_vmv_x_s_i16m1_i16(vReduce);
+
+				if (LIKELY(temp > max)) {
+					max = temp;
+					end_ref = i;
+					for (j = 0; LIKELY(j < segLen); ++j) {
+						vint16m1_t tmp = __riscv_vle16_v_i16m1((const int16_t*)(pvHStore + j * vb), vl);
+						__riscv_vse16_v_i16m1((int16_t*)(pvHmax + j * vb), tmp, vl);
+					}
+				}
+			}
+		}
+
+		/* Record the max score of current column. */
+		{
+			vint16m1_t vReduce = __riscv_vredmax_vs_i16m1_i16m1(vMaxColumn, vZero, vl);
+			maxColumn[i] = (uint16_t)__riscv_vmv_x_s_i16m1_i16(vReduce);
+		}
+		if (maxColumn[i] == terminate) break;
+	}
+
+	/* Trace the alignment ending position on read. */
+	uint16_t *t = (uint16_t*)pvHmax;
+	int32_t column_len = segLen * (int32_t)vl;
+	for (i = 0; LIKELY(i < column_len); ++i, ++t) {
+		int32_t temp;
+		if (*t == max) {
+			temp = i / (int32_t)vl + i % (int32_t)vl * segLen;
+			if (temp < end_read) end_read = temp;
+		}
+	}
+
+	free(pvHmax);
+	free(pvE);
+	free(pvHLoad);
+	free(pvHStore);
+
+	/* Find the most possible 2nd best alignment. */
+	alignment_end* bests = (alignment_end*) calloc(2, sizeof(alignment_end));
+	bests[0].score = max;
+	bests[0].ref = end_ref;
+	bests[0].read = end_read;
+
+	bests[1].score = 0;
+	bests[1].ref = 0;
+	bests[1].read = 0;
+
+	edge = (end_ref - maskLen) > 0 ? (end_ref - maskLen) : 0;
+	for (i = 0; i < edge; i ++) {
+		if (maxColumn[i] > bests[1].score) {
+			bests[1].score = maxColumn[i];
+			bests[1].ref = i;
+		}
+	}
+	edge = (end_ref + maskLen) > refLen ? refLen : (end_ref + maskLen);
+	for (i = edge; i < refLen; i ++) {
+		if (maxColumn[i] > bests[1].score) {
+			bests[1].score = maxColumn[i];
+			bests[1].ref = i;
+		}
+	}
+
+	free(maxColumn);
+	free(end_read_column);
+	return bests;
+}
+
+static cigar* banded_sw (const int8_t* ref,
+				 const int8_t* read,
+				 int32_t refLen,
+				 int32_t readLen,
+				 int32_t score,
+				 const uint32_t weight_gapO,  /* will be used as - */
+				 const uint32_t weight_gapE,  /* will be used as - */
+				 int32_t band_width,
+				 const int8_t* mat,	/* pointer to the weight matrix */
+				 int32_t n) {
+
+	uint32_t *c = (uint32_t*)malloc(16 * sizeof(uint32_t)), *c1;
+	int32_t i, j, e, f, temp1, temp2, s = 16, s1 = 8, l, max = 0, len;
+	int32_t max_i = 0, max_j = 0;
+	int64_t s2 = 1024;
+	char op, prev_op;
+	int32_t width, width_d, *h_b, *e_b, *h_c;
+	int8_t *direction, *direction_line;
+	const int32_t neg_inf = INT32_MIN / 2;
+    len = refLen > readLen ? refLen : readLen;
+	cigar* result = (cigar*)malloc(sizeof(cigar));
+	h_b = (int32_t*)malloc(s1 * sizeof(int32_t));
+	e_b = (int32_t*)malloc(s1 * sizeof(int32_t));
+	h_c = (int32_t*)malloc(s1 * sizeof(int32_t));
+	direction = (int8_t*)malloc(s2 * sizeof(int8_t));
+
+	do {
+		width = band_width * 2 + 3, width_d = band_width * 2 + 1;
+		while (width >= s1) {
+			++s1;
+			kroundup32(s1);
+			h_b = (int32_t*)realloc(h_b, s1 * sizeof(int32_t));
+			e_b = (int32_t*)realloc(e_b, s1 * sizeof(int32_t));
+			h_c = (int32_t*)realloc(h_c, s1 * sizeof(int32_t));
+		}
+		while (width_d * readLen * 3 >= s2) {   // width_d*readLen* overflow before s2
+			++s2;
+			kroundup32(s2);
+			direction = (int8_t*)realloc(direction, s2 * sizeof(int8_t));
+		}
+		direction_line = direction;
+		for (j = 1; LIKELY(j < width - 1); j ++) h_b[j] = 0;
+		for (i = 0; LIKELY(i < readLen); i ++) {
+			int32_t beg = 0, end = refLen - 1, u = 0, edge;
+			j = i - band_width;	beg = beg > j ? beg : j; // band start
+			j = i + band_width; end = end < j ? end : j; // band end
+			edge = end + 1 < width - 1 ? end + 1 : width - 1;
+			f = neg_inf;
+			h_b[0] = h_b[edge] = h_c[0] = 0;
+			e_b[0] = e_b[edge] = neg_inf;
+			direction_line = direction + width_d * i * 3;
+
+			for (j = beg; LIKELY(j <= end); j ++) {
+				int32_t b, e1, f1, d, de, df, dh;
+				set_u(u, band_width, i, j);	set_u(e, band_width, i - 1, j);
+				set_u(b, band_width, i, j - 1); set_u(d, band_width, i - 1, j - 1);
+				set_d(de, band_width, i, j, 0);
+				set_d(df, band_width, i, j, 1);
+				set_d(dh, band_width, i, j, 2);
+
+				temp1 = i == 0 ? -weight_gapO : h_b[e] - weight_gapO;
+				temp2 = i == 0 ? neg_inf : e_b[e] - weight_gapE;
+                //fprintf(stderr, "e_b length: %d, u: %d\n", s1, u);
+				e_b[u] = temp1 > temp2 ? temp1 : temp2;
+				direction_line[de] = temp1 > temp2 ? 3 : 2;
+
+				temp1 = h_c[b] - weight_gapO;
+				temp2 = f - weight_gapE;
+				f = temp1 > temp2 ? temp1 : temp2;
+				direction_line[df] = temp1 > temp2 ? 5 : 4;
+
+				e1 = e_b[u] > 0 ? e_b[u] : 0;
+				f1 = f > 0 ? f : 0;
+				temp1 = e1 > f1 ? e1 : f1;
+				temp2 = h_b[d] + mat[ref[j] * n + read[i]];
+				h_c[u] = temp1 > temp2 ? temp1 : temp2;
+
+				if (h_c[u] > max) {
+					max = h_c[u];
+					max_i = i;
+					max_j = j;
+				}
+
+				if (temp1 <= temp2) direction_line[dh] = 1;
+				else direction_line[dh] = e1 > f1 ? direction_line[de] : direction_line[df];
+			}
+			for (j = 1; j <= u; j ++) h_b[j] = h_c[j];
+		}
+		band_width *= 2;
+	} while (max < score && band_width <= len); // 2022-Apr-08
+	band_width /= 2;
+
+	// trace back
+	i = max_i;
+	j = max_j;
+	e = 0;	// Count the number of M, D or I.
+	l = 0;	// record length of current cigar
+	op = prev_op = 'M';
+	temp2 = 2;	// h
+	direction_line = direction + width_d * i * 3;
+    while (LIKELY(i >= 0 && j > 0)) {
+		set_d(temp1, band_width, i, j, temp2);
+		switch (direction_line[temp1]) {
+			case 1:
+				--i;
+				--j;
+				temp2 = 2;
+				direction_line -= width_d * 3;
+				op = 'M';
+				break;
+			case 2:
+			 	--i;
+				temp2 = 0;	// e
+				direction_line -= width_d * 3;
+				op = 'I';
+				break;
+			case 3:
+				--i;
+				temp2 = 2;
+				direction_line -= width_d * 3;
+				op = 'I';
+				break;
+			case 4:
+				--j;
+				temp2 = 1;
+				op = 'D';
+				break;
+			case 5:
+				--j;
+				temp2 = 2;
+				op = 'D';
+				break;
+			default:
+				fprintf(stderr, "Trace back error: %d.\n", direction_line[temp1 - 1]);
+				free(direction);
+				free(h_c);
+				free(e_b);
+				free(h_b);
+				free(c);
+				free(result);
+				return 0;
+		}
+		if (op == prev_op) ++e;
+		else {
+			++l;
+			while (l >= s) {
+				++s;
+				kroundup32(s);
+				c = (uint32_t*)realloc(c, s * sizeof(uint32_t));
+			}
+			c[l - 1] = to_cigar_int(e, prev_op);
+			prev_op = op;
+			e = 1;
+		}
+	}
+	if (op == 'M') {
+		++l;
+		while (l >= s) {
+			++s;
+			kroundup32(s);
+			c = (uint32_t*)realloc(c, s * sizeof(uint32_t));
+		}
+		c[l - 1] = to_cigar_int(e + 1, op);
+	}else {
+		l += 2;
+		while (l >= s) {
+			++s;
+			kroundup32(s);
+			c = (uint32_t*)realloc(c, s * sizeof(uint32_t));
+		}
+		c[l - 2] = to_cigar_int(e, op);
+		c[l - 1] = to_cigar_int(1, 'M');
+	}
+
+	// reverse cigar
+	c1 = (uint32_t*)malloc(l * sizeof(uint32_t));
+	s = 0;
+	e = l - 1;
+	while (LIKELY(s <= e)) {
+		c1[s] = c[e];
+		c1[e] = c[s];
+		++ s;
+		-- e;
+	}
+	result->seq = c1;
+	result->length = l;
+
+	free(direction);
+	free(h_c);
+	free(e_b);
+	free(h_b);
+	free(c);
+	return result;
+}
+
+static int32_t cigar_alignment_score(const cigar* path,
+									 const int8_t* ref,
+									 const int8_t* read,
+									 const int8_t* mat,
+									 int32_t n,
+									 const uint32_t weight_gapO,
+									 const uint32_t weight_gapE) {
+	int32_t score = 0;
+	int32_t ref_pos = 0, read_pos = 0;
+	for (int32_t i = 0; i < path->length; ++i) {
+		uint32_t len = cigar_int_to_len(path->seq[i]);
+		char op = cigar_int_to_op(path->seq[i]);
+		if (op == 'M') {
+			for (uint32_t j = 0; j < len; ++j) {
+				score += mat[ref[ref_pos] * n + read[read_pos]];
+				++ref_pos;
+				++read_pos;
+			}
+		} else {
+			int32_t penalty = weight_gapO + (len > 1 ? (len - 1) * weight_gapE : 0);
+			score -= penalty;
+			if (op == 'I') read_pos += len;
+			else if (op == 'D') ref_pos += len;
+		}
+	}
+	return score;
+}
+
+static int8_t* seq_reverse(const int8_t* seq, int32_t end)	/* end is 0-based alignment ending position */
+{
+	int8_t* reverse = (int8_t*)calloc(end + 1, sizeof(int8_t));
+	int32_t start = 0;
+	while (LIKELY(start <= end)) {
+		reverse[start] = seq[end];
+		reverse[end] = seq[start];
+		++ start;
+		-- end;
+	}
+	return reverse;
+}
+
+s_profile* ssw_init (const int8_t* read, const int32_t readLen, const int8_t* mat, const int32_t n, const int8_t score_size) {
+	s_profile* p = (s_profile*)calloc(1, sizeof(struct _profile));
+	p->profile_byte = 0;
+	p->profile_word = 0;
+	p->bias = 0;
+
+	if (score_size == 0 || score_size == 2) {
+		/* Find the bias to use in the substitution matrix */
+		int32_t bias = 0, i;
+		for (i = 0; i < n*n; i++) if (mat[i] < bias) bias = mat[i];
+		bias = abs(bias);
+
+		p->bias = bias;
+		p->profile_byte = qP_byte (read, mat, readLen, n, bias);
+	}
+	if (score_size == 1 || score_size == 2) p->profile_word = qP_word (read, mat, readLen, n);
+	p->read = read;
+	p->mat = mat;
+	p->readLen = readLen;
+	p->n = n;
+	return p;
+}
+
+void init_destroy (s_profile* p) {
+	free(p->profile_byte);
+	free(p->profile_word);
+	free(p);
+}
+
+s_align* ssw_align (const s_profile* prof,
+					const int8_t* ref,
+				  	int32_t refLen,
+				  	const uint8_t weight_gapO,
+				  	const uint8_t weight_gapE,
+					const uint8_t flag,	//  (from high to low) bit 5: return the best alignment beginning position; 6: if (ref_end1 - ref_begin1 <= filterd) && (read_end1 - read_begin1 <= filterd), return cigar; 7: if max score >= filters, return cigar; 8: always return cigar; if 6 & 7 are both setted, only return cigar when both filter fulfilled
+					const uint16_t filters,
+					const int32_t filterd,
+					const int32_t maskLen) {
+
+	alignment_end* bests = 0, *bests_reverse = 0;
+	uint8_t* vP = 0;
+	int32_t word = 0, band_width = 0, readLen = prof->readLen;
+	int8_t* read_reverse = 0;
+	cigar* path;
+	s_align* r = (s_align*)calloc(1, sizeof(s_align));
+	r->ref_begin1 = -1;
+	r->read_begin1 = -1;
+	r->cigar = 0;
+	r->cigarLen = 0;
+    r->flag = 0;
+	if (maskLen < 15) {
+		fprintf(stderr, "When maskLen < 15, the function ssw_align doesn't return 2nd best alignment information.\n");
+	}
+
+	// Find the alignment scores and ending positions
+	if (prof->profile_byte) {
+		bests = sw_rvv_byte(ref, 0, refLen, readLen, weight_gapO, weight_gapE, prof->profile_byte, -1, prof->bias, maskLen);
+		if (prof->profile_word && bests[0].score == 255) {
+			free(bests);
+			bests = sw_rvv_word(ref, 0, refLen, readLen, weight_gapO, weight_gapE, prof->profile_word, -1, maskLen);
+			word = 1;
+		} else if (bests[0].score == 255) {
+			fprintf(stderr, "Please set 2 to the score_size parameter of the function ssw_init, otherwise the alignment results will be incorrect.\n");
+			free(r);
+			return NULL;
+		}
+	}else if (prof->profile_word) {
+		bests = sw_rvv_word(ref, 0, refLen, readLen, weight_gapO, weight_gapE, prof->profile_word, -1, maskLen);
+		word = 1;
+	}else {
+		fprintf(stderr, "Please call the function ssw_init before ssw_align.\n");
+		free(r);
+		return NULL;
+	}
+	if (bests[0].score <= 0) {
+		free(bests);
+		goto end;
+	}
+
+	r->score1 = bests[0].score;
+	r->ref_end1 = bests[0].ref; // 0_based, always count from the input seq begin
+	r->read_end1 = bests[0].read;   // 0_based, count from the alignment begin (aligned length of the read)
+	if (maskLen >= 15) {
+		r->score2 = bests[1].score;
+		r->ref_end2 = bests[1].ref;
+	} else {
+		r->score2 = 0;
+		r->ref_end2 = -1;
+	}
+	free(bests);
+	if (flag == 0 || (flag == 2 && r->score1 < filters)) goto end;
+
+	// Find the beginning position of the best alignment.
+	read_reverse = seq_reverse(prof->read, r->read_end1);
+	if (word == 0) {
+		vP = qP_byte(read_reverse, prof->mat, r->read_end1 + 1, prof->n, prof->bias);
+		bests_reverse = sw_rvv_byte(ref, 1, r->ref_end1 + 1, r->read_end1 + 1, weight_gapO, weight_gapE, vP, r->score1, prof->bias, maskLen);
+	} else {
+		vP = qP_word(read_reverse, prof->mat, r->read_end1 + 1, prof->n);
+		bests_reverse = sw_rvv_word(ref, 1, r->ref_end1 + 1, r->read_end1 + 1, weight_gapO, weight_gapE, vP, r->score1, maskLen);
+	}
+	free(vP);
+	free(read_reverse);
+	r->ref_begin1 = bests_reverse[0].ref;
+	r->read_begin1 = r->read_end1 - bests_reverse[0].read;
+
+    if (UNLIKELY(r->score1 > bests_reverse[0].score)) { // banded_sw result will miss a small part
+		fprintf(stderr, "Warning: The alignment path of one pair of sequences may miss a small part. [ssw.c ssw_align]\n");
+        r->flag = 2;
+    }
+    free(bests_reverse);
+
+	if ((7&flag) == 0 || ((2&flag) != 0 && r->score1 < filters) || ((4&flag) != 0 && (r->ref_end1 - r->ref_begin1 > filterd || r->read_end1 - r->read_begin1 > filterd))) goto end;
+
+	// Generate cigar.
+	refLen = r->ref_end1 - r->ref_begin1 + 1;
+	readLen = r->read_end1 - r->read_begin1 + 1;
+	band_width = abs(refLen - readLen) + 1;
+	int32_t full_band = refLen > readLen ? refLen : readLen;
+	while (1) {
+		path = banded_sw(ref + r->ref_begin1, prof->read + r->read_begin1, refLen, readLen, r->score1, weight_gapO, weight_gapE, band_width, prof->mat, prof->n);
+		if (path == 0) break;
+		int32_t cigar_score = cigar_alignment_score(path, ref + r->ref_begin1, prof->read + r->read_begin1, prof->mat, prof->n, weight_gapO, weight_gapE);
+		if (cigar_score == r->score1) break;
+		free(path->seq);
+		free(path);
+		if (band_width >= full_band) {
+			path = 0;
+			break;
+		}
+		band_width = full_band;
+	}
+
+    if (path == 0) r->flag = 1;    // banded_sw is failed.
+    else {
+		r->cigar = path->seq;
+		r->cigarLen = path->length;
+		free(path);
+	}
+
+end:
+	return r;
+}
+
+void align_destroy (s_align* a) {
+	free(a->cigar);
+	free(a);
+}
+
+uint32_t* add_cigar (uint32_t* new_cigar, int32_t* p, int32_t* s, uint32_t length, char op) {
+	if ((*p) >= (*s)) {
+		++(*s);
+		kroundup32(*s);
+		new_cigar = (uint32_t*)realloc(new_cigar, (*s)*sizeof(uint32_t));
+	}
+	new_cigar[(*p) ++] = to_cigar_int(length, op);
+	return new_cigar;
+}
+
+uint32_t* store_previous_m (int8_t choice,	// 0: current not M, 1: current match, 2: current mismatch
+					   uint32_t* length_m,
+					   uint32_t* length_x,
+					   int32_t* p,
+					   int32_t* s,
+					   uint32_t* new_cigar) {
+
+	if ((*length_m) && (choice == 2 || !choice)) {
+		new_cigar = add_cigar (new_cigar, p, s, (*length_m), '=');
+		(*length_m) = 0;
+	} else if ((*length_x) && (choice == 1 || !choice)) {
+		new_cigar = add_cigar (new_cigar, p, s, (*length_x), 'X');
+		(*length_x) = 0;
+	}
+	return new_cigar;
+}
+
+int32_t mark_mismatch (int32_t ref_begin1,
+					   int32_t read_begin1,
+					   int32_t read_end1,
+					   const int8_t* ref,
+					   const int8_t* read,
+					   int32_t readLen,
+					   uint32_t** cigar,
+					   int32_t* cigarLen) {
+
+	int32_t mismatch_length = 0, p = 0, i, length, j, s = *cigarLen + 2;
+	uint32_t *new_cigar = (uint32_t*)malloc(s*sizeof(uint32_t)), length_m = 0,  length_x = 0;
+	char op;
+
+	ref += ref_begin1;
+	read += read_begin1;
+	if (read_begin1 > 0) new_cigar[p ++] = to_cigar_int(read_begin1, 'S');
+	for (i = 0; i < (*cigarLen); ++i) {
+		op = cigar_int_to_op((*cigar)[i]);
+		length = cigar_int_to_len((*cigar)[i]);
+		if (op == 'M') {
+			for (j = 0; j < length; ++j) {
+				if (*ref != *read) {
+					++ mismatch_length;
+					new_cigar = store_previous_m (2, &length_m, &length_x, &p, &s, new_cigar);
+					++ length_x;
+				} else {
+					new_cigar = store_previous_m (1, &length_m, &length_x, &p, &s, new_cigar);
+					++ length_m;
+				}
+				++ ref;
+				++ read;
+			}
+		}else if (op == 'I') {
+			read += length;
+			mismatch_length += length;
+			new_cigar = store_previous_m (0, &length_m, &length_x, &p, &s, new_cigar);
+			new_cigar = add_cigar (new_cigar, &p, &s, length, 'I');
+		}else if (op == 'D') {
+			ref += length;
+			mismatch_length += length;
+			new_cigar = store_previous_m (0, &length_m, &length_x, &p, &s, new_cigar);
+			new_cigar = add_cigar (new_cigar, &p, &s, length, 'D');
+		}
+	}
+	new_cigar = store_previous_m (0, &length_m, &length_x, &p, &s, new_cigar);
+
+	length = readLen - read_end1 - 1;
+	if (length > 0) new_cigar = add_cigar(new_cigar, &p, &s, length, 'S');
+
+	(*cigarLen) = p;
+	free(*cigar);
+	(*cigar) = new_cigar;
+	return mismatch_length;
+}
