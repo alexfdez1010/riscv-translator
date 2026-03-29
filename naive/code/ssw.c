@@ -135,7 +135,7 @@ static align_end sw_core(const int8_t *ref, int8_t ref_dir,
             int32_t h = H[IDX(ci, cj, cols)];
             int32_t ref_idx = ref_dir ? (refLen - cj) : (cj - 1);
 
-            if (h > best.score) {
+            if (h > best.score || (h == best.score && ref_idx < best.ref)) {
                 best.score = h;
                 best.ref = ref_idx;
             }
