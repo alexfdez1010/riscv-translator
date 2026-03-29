@@ -31,6 +31,7 @@ logger = get_logger(__name__)
 
 DEFAULT_ORIGINAL_DIR = PROJECT_DIR / "initial_code"
 DEFAULT_TRANSLATED_DIR = PROJECT_DIR / "translations" / "sequence-alignment"
+DEFAULT_NAIVE_DIR = PROJECT_DIR / "naive" / "code"
 DEFAULT_DATASET = "1M.fa"
 REFERENCE_FILE = "54mer_hap1_1.100.fa"
 
@@ -276,8 +277,8 @@ _EXTRA_FIELDS = [
 
 
 def compare_outputs(
-    intel: BenchmarkResult,
-    riscv: BenchmarkResult,
+    reference: BenchmarkResult,
+    other: BenchmarkResult,
     *,
     strict_suboptimal: bool = False,
 ) -> tuple[bool, str]:
@@ -291,12 +292,14 @@ def compare_outputs(
 
     Returns ``(match, details)``.
     """
-    intel_recs = _parse_alignment_records(intel.stdout)
-    riscv_recs = _parse_alignment_records(riscv.stdout)
+    ref_label = reference.label
+    other_label = other.label
+    ref_recs = _parse_alignment_records(reference.stdout)
+    other_recs = _parse_alignment_records(other.stdout)
 
-    if len(intel_recs) != len(riscv_recs):
+    if len(ref_recs) != len(other_recs):
         return False, (
-            f"Record count mismatch: Intel={len(intel_recs)}, RISC-V={len(riscv_recs)}"
+            f"Record count mismatch: {ref_label}={len(ref_recs)}, {other_label}={len(other_recs)}"
         )
 
     fields_to_check = list(_REQUIRED_FIELDS)
@@ -305,7 +308,7 @@ def compare_outputs(
     fields_to_check += _EXTRA_FIELDS
 
     mismatches: list[str] = []
-    for idx, (a, b) in enumerate(zip(intel_recs, riscv_recs)):
+    for idx, (a, b) in enumerate(zip(ref_recs, other_recs)):
         for field in fields_to_check:
             va = a.get(field)
             vb = b.get(field)
@@ -319,15 +322,15 @@ def compare_outputs(
                 query = a.get("query_name", f"record #{idx+1}")
                 mismatches.append(
                     f"  record {idx+1} ({query}): "
-                    f"{field} Intel={va!r} RISC-V={vb!r}"
+                    f"{field} {ref_label}={va!r} {other_label}={vb!r}"
                 )
 
     if not mismatches:
         ignored = "" if strict_suboptimal else " (suboptimal_alignment_score ignored)"
-        return True, f"Outputs match: {len(intel_recs)} alignment records compared.{ignored}"
+        return True, f"Outputs match: {len(ref_recs)} alignment records compared.{ignored}"
 
     details = [
-        f"Alignment records compared: {len(intel_recs)}",
+        f"Alignment records compared: {len(ref_recs)}",
         f"Mismatched fields: {len(mismatches)}",
         "First differences:",
     ]
@@ -342,10 +345,16 @@ def benchmark(
     dataset: str = DEFAULT_DATASET,
     original_dir: Path = DEFAULT_ORIGINAL_DIR,
     translated_dir: Path = DEFAULT_TRANSLATED_DIR,
+    naive_dir: Path | None = DEFAULT_NAIVE_DIR,
     dataset_dir: Path = DATASETS_DIR,
     strict_suboptimal: bool = False,
 ) -> int:
-    """Run benchmark comparing original SSE code on Intel vs translated RVV code on RISC-V."""
+    """Run benchmark comparing original SSE code on Intel vs translated RVV code on RISC-V.
+
+    When *naive_dir* is provided, the naive RISC-V implementation is also
+    compiled and run on the RISC-V host and included in the comparison.
+    Pass ``None`` to skip the naive run.
+    """
     run_intel_locally = not SSH_JUMP_HOST
     jump_host = SSH_JUMP_HOST
     final_host = SSH_HOST
@@ -357,6 +366,8 @@ def benchmark(
     else:
         logger.info("Original code: %s -> %s (Intel, SSH)", original_dir, jump_host)
     logger.info("Translated code: %s -> %s (RISC-V)", translated_dir, final_host)
+    if naive_dir:
+        logger.info("Naive code: %s -> %s (RISC-V)", naive_dir, final_host)
 
     # Check connectivity for remote hosts
     if not run_intel_locally:
@@ -397,6 +408,24 @@ def benchmark(
             jump_host, jump_remote, intel_compile, run_cmd_suffix, "Intel (original SSE)",
         )
 
+    # --- RISC-V (naive implementation) ---
+    naive_result = None
+    if naive_dir:
+        naive_remote = f"{REMOTE_DIR}-bench-naive"
+        naive_files = [p for p in naive_dir.iterdir() if p.is_file()]
+        naive_dirs = [p for p in naive_dir.iterdir() if p.is_dir()]
+        logger.info("Uploading naive code to %s:%s ...", final_host, naive_remote)
+        if not upload_to_host(final_host, naive_remote, naive_files + naive_dirs):
+            return 1
+        if not upload_datasets(final_host, naive_remote, dataset_dir, dataset):
+            return 1
+
+        logger.info("Running naive code on RISC-V (%s) ...", final_host)
+        naive_compile = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
+        naive_result = run_on_host(
+            final_host, naive_remote, naive_compile, run_cmd_suffix, "RISC-V (naive)",
+        )
+
     # --- RISC-V (translated RVV) ---
     translated_files = [p for p in translated_dir.iterdir() if p.is_file()]
     translated_dirs = [p for p in translated_dir.iterdir() if p.is_dir()]
@@ -413,44 +442,53 @@ def benchmark(
     )
 
     # Report
+    all_results = [intel_result]
+    if naive_result:
+        all_results.append(naive_result)
+    all_results.append(riscv_result)
+
     print("\n" + "=" * 60)
     print("BENCHMARK RESULTS")
     print("=" * 60)
     print(f"Dataset: {dataset}")
     print("-" * 60)
 
-    for r in [intel_result, riscv_result]:
+    for r in all_results:
         status = "PASS" if r.ok else "FAIL"
         print(f"  {r.label:30s}  {status:5s}  {r.elapsed_seconds:8.2f}s  ({r.host})")
 
     print("-" * 60)
 
-    if not intel_result.ok or not riscv_result.ok:
+    failed = [r for r in all_results if not r.ok]
+    if failed:
         print("\nOne or more executions failed.")
-        if not intel_result.ok:
-            print(f"\n[Intel stderr]\n{intel_result.stderr}")
-        if not riscv_result.ok:
-            print(f"\n[RISC-V stderr]\n{riscv_result.stderr}")
+        for r in failed:
+            print(f"\n[{r.label} stderr]\n{r.stderr}")
         return 1
 
-    # Compare outputs for correctness
-    match, details = compare_outputs(
-        intel_result, riscv_result, strict_suboptimal=strict_suboptimal,
-    )
+    # Compare outputs for correctness (all vs Intel reference)
+    all_match = True
+    for r in all_results[1:]:
+        match, details = compare_outputs(
+            intel_result, r, strict_suboptimal=strict_suboptimal,
+        )
+        label = r.label
+        print(f"\nOutput comparison (Intel vs {label}): {'MATCH' if match else 'MISMATCH'}")
+        print(details)
+        if not match:
+            all_match = False
 
-    print(f"\nOutput comparison: {'MATCH' if match else 'MISMATCH'}")
-    print(details)
-
-    if not match:
-        print("\nBenchmark FAILED: outputs differ between Intel and RISC-V.")
+    if not all_match:
+        print("\nBenchmark FAILED: outputs differ.")
         return 1
 
     # Timing comparison
     if intel_result.elapsed_seconds > 0:
-        ratio = riscv_result.elapsed_seconds / intel_result.elapsed_seconds
-        print(f"\nRISC-V / Intel time ratio: {ratio:.2f}x")
+        for r in all_results[1:]:
+            ratio = r.elapsed_seconds / intel_result.elapsed_seconds
+            print(f"\n{r.label} / Intel time ratio: {ratio:.2f}x")
 
-    print("\nBenchmark PASSED: both produce identical output.")
+    print("\nBenchmark PASSED: all implementations produce identical output.")
     return 0
 
 
@@ -476,6 +514,18 @@ def parse_args() -> argparse.Namespace:
         help="Directory with translated RVV source code",
     )
     parser.add_argument(
+        "--naive-dir",
+        type=Path,
+        default=DEFAULT_NAIVE_DIR,
+        help="Directory with naive RISC-V implementation (omit to skip)",
+    )
+    parser.add_argument(
+        "--no-naive",
+        action="store_true",
+        default=False,
+        help="Skip the naive RISC-V implementation benchmark",
+    )
+    parser.add_argument(
         "--dataset-dir",
         type=Path,
         default=DATASETS_DIR,
@@ -493,10 +543,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_logging(level="INFO")
     args = parse_args()
+    naive = None if args.no_naive else args.naive_dir
     return benchmark(
         dataset=args.dataset,
         original_dir=args.original_dir,
         translated_dir=args.translated_dir,
+        naive_dir=naive,
         dataset_dir=args.dataset_dir,
         strict_suboptimal=args.strict_suboptimal,
     )
