@@ -488,6 +488,10 @@ def benchmark(
             ratio = r.elapsed_seconds / intel_result.elapsed_seconds
             print(f"\n{r.label} / Intel time ratio: {ratio:.2f}x")
 
+    if naive_result and naive_result.ok and riscv_result.ok and riscv_result.elapsed_seconds > 0:
+        speedup = naive_result.elapsed_seconds / riscv_result.elapsed_seconds
+        print(f"\nRVV speedup over naive: {speedup:.2f}x")
+
     print("\nBenchmark PASSED: all implementations produce identical output.")
     return 0
 
