@@ -189,12 +189,22 @@ def prepare_local_dir(
 
 
 def normalize_output(raw: str) -> str:
-    """Normalize alignment output for comparison: strip trailing whitespace per line, skip empty lines,
-    and remove CPU time measurements (which naturally differ between platforms)."""
+    """Normalize alignment output for comparison.
+
+    Strips trailing whitespace, removes empty lines, and removes CPU time
+    measurements (which naturally differ between platforms).
+
+    CPU time messages from stderr can interleave mid-line when ``2>&1`` is
+    used (e.g. ``"optimal_alignmCPU time: 1.23 seconds\\nent_score: …"``),
+    so we strip them from the raw string *before* splitting into lines and
+    then rejoin any line that was split by the removal.
+    """
     import re
-    lines = [line.rstrip() for line in raw.strip().splitlines()]
-    # Remove CPU time suffixes like "CPU time: 0.074732 seconds"
-    lines = [re.sub(r'CPU time:\s*[\d.]+\s*seconds', '', line).rstrip() for line in lines]
+    # Strip CPU time stamps that may appear anywhere (including mid-line).
+    # The newline that the CPU time fprintf adds is consumed by \s* so the
+    # two halves of the interrupted line get glued back together.
+    cleaned = re.sub(r'CPU time:\s*[\d.]+\s*seconds\s*\n?', '', raw)
+    lines = [line.rstrip() for line in cleaned.strip().splitlines()]
     return "\n".join(line for line in lines if line)
 
 

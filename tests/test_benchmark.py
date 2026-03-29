@@ -338,6 +338,13 @@ class TestNormalizeOutput:
         raw = "  line1  \n\n  line2  \n\n"
         assert normalize_output(raw) == "line1\n  line2"
 
+    def test_cpu_time_interleaved_midline(self):
+        """CPU time from stderr can land mid-line when 2>&1 is used."""
+        raw = "optimal_alignmCPU time: 5.88 seconds\nent_score: 30\tstrand: +\n"
+        result = normalize_output(raw)
+        assert "optimal_alignment_score: 30" in result
+        assert "CPU time" not in result
+
 
 class TestCompareOutputs:
     _SSW_REC = (
