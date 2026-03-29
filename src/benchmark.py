@@ -10,11 +10,12 @@ Usage:
 """
 
 import argparse
+import math
 import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.config import (
@@ -31,9 +32,56 @@ logger = get_logger(__name__)
 
 DEFAULT_ORIGINAL_DIR = PROJECT_DIR / "initial_code"
 DEFAULT_TRANSLATED_DIR = PROJECT_DIR / "translations" / "sequence-alignment"
-DEFAULT_NAIVE_DIR = PROJECT_DIR / "naive" / "code"
 DEFAULT_DATASET = "1M.fa"
 REFERENCE_FILE = "54mer_hap1_1.100.fa"
+
+
+@dataclass(slots=True)
+class TimingStats:
+    """Statistics computed from multiple benchmark runs."""
+    times: list[float]
+
+    @property
+    def n(self) -> int:
+        return len(self.times)
+
+    @property
+    def mean(self) -> float:
+        return sum(self.times) / len(self.times) if self.times else 0.0
+
+    @property
+    def median(self) -> float:
+        if not self.times:
+            return 0.0
+        s = sorted(self.times)
+        mid = len(s) // 2
+        if len(s) % 2 == 0:
+            return (s[mid - 1] + s[mid]) / 2
+        return s[mid]
+
+    @property
+    def stdev(self) -> float:
+        if len(self.times) < 2:
+            return 0.0
+        m = self.mean
+        return math.sqrt(sum((t - m) ** 2 for t in self.times) / (len(self.times) - 1))
+
+    @property
+    def min(self) -> float:
+        return min(self.times) if self.times else 0.0
+
+    @property
+    def max(self) -> float:
+        return max(self.times) if self.times else 0.0
+
+    def summary(self) -> str:
+        if self.n == 1:
+            return f"{self.times[0]:.2f}s"
+        return (
+            f"mean={self.mean:.2f}s  median={self.median:.2f}s  "
+            f"stdev={self.stdev:.2f}s  min={self.min:.2f}s  max={self.max:.2f}s  "
+            f"(n={self.n})"
+        )
 
 
 @dataclass(slots=True)
@@ -44,6 +92,7 @@ class BenchmarkResult:
     elapsed_seconds: float
     stdout: str
     stderr: str
+    stats: TimingStats | None = None
 
 
 def check_ssh(host: str) -> bool:
@@ -164,6 +213,43 @@ def run_locally(
         host="localhost", label=label, ok=ok, elapsed_seconds=elapsed,
         stdout=run.stdout, stderr=run.stderr,
     )
+
+
+def rerun_on_host(
+    host: str,
+    remote_dir: str,
+    run_cmd: str,
+    label: str,
+) -> float:
+    """Re-run an already-compiled binary on a remote host, return elapsed time."""
+    start = time.monotonic()
+    run = subprocess.run(
+        ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
+        capture_output=True, timeout=60 * 60 * 24, text=True,
+    )
+    elapsed = time.monotonic() - start
+    if run.returncode != 0:
+        logger.warning("[%s] Re-run failed (rc=%d), skipping this iteration", label, run.returncode)
+        return -1.0
+    return elapsed
+
+
+def rerun_locally(
+    work_dir: Path,
+    run_cmd: str,
+    label: str,
+) -> float:
+    """Re-run an already-compiled binary locally, return elapsed time."""
+    start = time.monotonic()
+    run = subprocess.run(
+        run_cmd, shell=True, cwd=work_dir,
+        capture_output=True, timeout=600, text=True,
+    )
+    elapsed = time.monotonic() - start
+    if run.returncode != 0:
+        logger.warning("[%s] Re-run failed (rc=%d), skipping this iteration", label, run.returncode)
+        return -1.0
+    return elapsed
 
 
 def prepare_local_dir(
@@ -368,19 +454,19 @@ def benchmark(
     dataset: str = DEFAULT_DATASET,
     original_dir: Path = DEFAULT_ORIGINAL_DIR,
     translated_dir: Path = DEFAULT_TRANSLATED_DIR,
-    naive_dir: Path | None = DEFAULT_NAIVE_DIR,
     dataset_dir: Path = DATASETS_DIR,
     strict_suboptimal: bool = False,
     rivals: list[tuple[str, Path]] | None = None,
+    runs: int = 1,
 ) -> int:
     """Run benchmark comparing implementations.
 
-    When *naive_dir* is provided, the naive RISC-V implementation is also
-    compiled and run on the RISC-V host and included in the comparison.
-    Pass ``None`` to skip the naive run.
-
     *rivals* is an optional list of ``(label, path)`` pairs for additional
     RISC-V implementations to include in the comparison.
+
+    *runs* controls how many times each implementation is executed.  When > 1,
+    the first run is used for correctness validation and all runs contribute
+    to timing statistics (mean, median, stdev, min, max).
     """
     run_intel_locally = not SSH_JUMP_HOST
     jump_host = SSH_JUMP_HOST
@@ -393,8 +479,6 @@ def benchmark(
     else:
         logger.info("Original code: %s -> %s (Intel, SSH)", original_dir, jump_host)
     logger.info("Translated code: %s -> %s (RISC-V)", translated_dir, final_host)
-    if naive_dir:
-        logger.info("Naive code: %s -> %s (RISC-V)", naive_dir, final_host)
     for label, path in (rivals or []):
         logger.info("Rival %s: %s -> %s (RISC-V)", label, path, final_host)
 
@@ -437,16 +521,6 @@ def benchmark(
             jump_host, jump_remote, intel_compile, run_cmd_suffix, "Intel (original SSE)",
         )
 
-    # --- RISC-V (naive implementation) ---
-    naive_result = None
-    if naive_dir:
-        naive_result = _run_riscv_entry(
-            "RISC-V (naive)", naive_dir, final_host,
-            f"{REMOTE_DIR}-bench-naive", dataset_dir, dataset, run_cmd_suffix,
-        )
-        if naive_result is None:
-            return 1
-
     # --- RISC-V (translated RVV) ---
     riscv_result = _run_riscv_entry(
         "RISC-V (translated RVV)", translated_dir, final_host,
@@ -467,25 +541,12 @@ def benchmark(
             return 1
         rival_results.append(result)
 
-    # Report
+    # Collect all results
     all_results = [intel_result]
-    if naive_result:
-        all_results.append(naive_result)
     all_results.append(riscv_result)
     all_results.extend(rival_results)
 
-    print("\n" + "=" * 60)
-    print("BENCHMARK RESULTS")
-    print("=" * 60)
-    print(f"Dataset: {dataset}")
-    print("-" * 60)
-
-    for r in all_results:
-        status = "PASS" if r.ok else "FAIL"
-        print(f"  {r.label:30s}  {status:5s}  {r.elapsed_seconds:8.2f}s  ({r.host})")
-
-    print("-" * 60)
-
+    # Check for failures before doing extra runs
     failed = [r for r in all_results if not r.ok]
     if failed:
         print("\nOne or more executions failed.")
@@ -493,7 +554,90 @@ def benchmark(
             print(f"\n[{r.label} stderr]\n{r.stderr}")
         return 1
 
-    # Compare outputs for correctness (all vs Intel reference)
+    # --- Repeated runs for timing statistics ---
+    # Build a mapping from each result to its rerun context so we can
+    # re-execute without recompiling.
+    @dataclass
+    class _RerunCtx:
+        host: str | None        # None = local
+        remote_dir: str | None  # None = local
+        local_dir: Path | None  # None = remote
+
+    rerun_map: dict[str, _RerunCtx] = {}
+
+    # Intel
+    if run_intel_locally:
+        # For local reruns we need the temp dir to still exist.  We recreate
+        # it if runs > 1 (the original was cleaned up).
+        rerun_map[intel_result.label] = _RerunCtx(
+            host=None, remote_dir=None,
+            local_dir=prepare_local_dir(original_dir, dataset_dir, dataset) if runs > 1 else None,
+        )
+    else:
+        rerun_map[intel_result.label] = _RerunCtx(
+            host=jump_host, remote_dir=f"{REMOTE_DIR}-bench-original", local_dir=None,
+        )
+
+    # Translated
+    rerun_map[riscv_result.label] = _RerunCtx(
+        host=final_host, remote_dir=final_remote, local_dir=None,
+    )
+
+    # Rivals
+    for idx, result in enumerate(rival_results):
+        rerun_map[result.label] = _RerunCtx(
+            host=final_host, remote_dir=f"{REMOTE_DIR}-bench-rival-{idx}", local_dir=None,
+        )
+
+    # Initialize stats with the first run's time
+    for r in all_results:
+        r.stats = TimingStats(times=[r.elapsed_seconds])
+
+    # Additional runs (2..N)
+    if runs > 1:
+        logger.info("Running %d additional iterations for timing statistics ...", runs - 1)
+        for iteration in range(2, runs + 1):
+            logger.info("--- Iteration %d/%d ---", iteration, runs)
+            for r in all_results:
+                ctx = rerun_map[r.label]
+                if ctx.host is not None:
+                    t = rerun_on_host(ctx.host, ctx.remote_dir, run_cmd_suffix, r.label)
+                else:
+                    t = rerun_locally(ctx.local_dir, run_cmd_suffix, r.label)
+                if t >= 0:
+                    r.stats.times.append(t)
+                    logger.info("  %s: %.2fs", r.label, t)
+
+        # Clean up local temp dirs
+        for ctx in rerun_map.values():
+            if ctx.local_dir is not None:
+                shutil.rmtree(ctx.local_dir, ignore_errors=True)
+
+        # Update elapsed_seconds to median for ratio calculations
+        for r in all_results:
+            r.elapsed_seconds = r.stats.median
+
+    # --- Report ---
+    print("\n" + "=" * 60)
+    print("BENCHMARK RESULTS")
+    print("=" * 60)
+    print(f"Dataset: {dataset}")
+    if runs > 1:
+        print(f"Runs: {runs}")
+    print("-" * 60)
+
+    if runs == 1:
+        for r in all_results:
+            status = "PASS" if r.ok else "FAIL"
+            print(f"  {r.label:30s}  {status:5s}  {r.elapsed_seconds:8.2f}s  ({r.host})")
+    else:
+        for r in all_results:
+            status = "PASS" if r.ok else "FAIL"
+            print(f"  {r.label:30s}  {status:5s}  {r.stats.summary()}")
+
+    print("-" * 60)
+
+    # Compare outputs for correctness (all vs Intel reference, from first run)
     all_match = True
     for r in all_results[1:]:
         match, details = compare_outputs(
@@ -505,21 +649,20 @@ def benchmark(
         if not match:
             all_match = False
 
-    # Timing comparison vs Intel
-    if intel_result.elapsed_seconds > 0:
+    # Timing comparison vs Intel (uses median when runs > 1)
+    ref_time = intel_result.elapsed_seconds
+    if ref_time > 0:
         for r in all_results[1:]:
-            ratio = r.elapsed_seconds / intel_result.elapsed_seconds
-            print(f"\n{r.label} / Intel time ratio: {ratio:.2f}x")
-
-    if naive_result and naive_result.ok and riscv_result.ok and riscv_result.elapsed_seconds > 0:
-        speedup = naive_result.elapsed_seconds / riscv_result.elapsed_seconds
-        print(f"\nRVV speedup over naive: {speedup:.2f}x")
+            ratio = r.elapsed_seconds / ref_time
+            time_label = "median" if runs > 1 else "time"
+            print(f"\n{r.label} / Intel {time_label} ratio: {ratio:.2f}x")
 
     # Cross-comparison between RISC-V implementations
     riscv_entries = [r for r in all_results[1:] if r.ok]
     if len(riscv_entries) >= 2:
         ref = riscv_entries[0]
-        print(f"\n--- RISC-V cross-comparison (reference: {ref.label}) ---")
+        time_label = "median" if runs > 1 else "time"
+        print(f"\n--- RISC-V cross-comparison (reference: {ref.label}, {time_label}) ---")
         for r in riscv_entries[1:]:
             if ref.elapsed_seconds > 0:
                 ratio = r.elapsed_seconds / ref.elapsed_seconds
@@ -564,18 +707,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory with translated RVV source code",
     )
     parser.add_argument(
-        "--naive-dir",
-        type=Path,
-        default=DEFAULT_NAIVE_DIR,
-        help="Directory with naive RISC-V implementation (omit to skip)",
-    )
-    parser.add_argument(
-        "--no-naive",
-        action="store_true",
-        default=False,
-        help="Skip the naive RISC-V implementation benchmark",
-    )
-    parser.add_argument(
         "--rival",
         action="append",
         default=[],
@@ -595,22 +726,29 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Also compare suboptimal_alignment_score (implementation-dependent)",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Run each implementation N times and report timing statistics "
+             "(mean, median, stdev, min, max). Default: 1",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     configure_logging(level="INFO")
     args = parse_args()
-    naive = None if args.no_naive else args.naive_dir
     rivals = [_parse_rival(r) for r in args.rival]
     return benchmark(
         dataset=args.dataset,
         original_dir=args.original_dir,
         translated_dir=args.translated_dir,
-        naive_dir=naive,
         dataset_dir=args.dataset_dir,
         strict_suboptimal=args.strict_suboptimal,
         rivals=rivals,
+        runs=args.runs,
     )
 
 

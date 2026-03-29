@@ -220,7 +220,6 @@ class TestBenchmarkLocalIntel:
             dataset="test.fa",
             original_dir=orig,
             translated_dir=trans,
-            naive_dir=None,
             dataset_dir=ds,
         )
 
@@ -267,7 +266,7 @@ class TestBenchmarkLocalIntel:
         trans.mkdir()
         (trans / "main.c").write_text("")
 
-        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, naive_dir=None, dataset_dir=tmp_path)
+        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, dataset_dir=tmp_path)
         assert rc == 1
 
 
@@ -303,7 +302,7 @@ class TestBenchmarkRemoteIntel:
         trans.mkdir()
         (trans / "main.c").write_text("")
 
-        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, naive_dir=None, dataset_dir=tmp_path)
+        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, dataset_dir=tmp_path)
 
         assert rc == 0
         # run_on_host called twice (Intel + RISC-V)
@@ -321,7 +320,7 @@ class TestBenchmarkRemoteIntel:
         trans = tmp_path / "trans"
         trans.mkdir()
 
-        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, naive_dir=None, dataset_dir=tmp_path)
+        rc = benchmark(dataset="t.fa", original_dir=orig, translated_dir=trans, dataset_dir=tmp_path)
         assert rc == 1
 
 
