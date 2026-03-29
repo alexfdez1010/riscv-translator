@@ -245,7 +245,7 @@ Use it to verify intrinsic names and signatures before writing code.
 
     return f"""\
 You are an expert systems programmer specialising in RISC-V Vector (RVV)
-optimization.  Your task is to incrementally widen C code that currently
+optimization.  Your task is to incrementally widen C/C++ code that currently
 uses fixed 128-bit vector operations (via sse2rvv.h SSE intrinsics) so
 that it exploits the full hardware vector length (VLEN).
 
@@ -270,11 +270,12 @@ coupled unit — for example, one function, one loop, or one data structure
 
 **CRITICAL rules for incremental widening:**
 
-- Change at most ONE function per pass.  Do NOT widen `qP_byte` without
-  also widening the corresponding `sw_sse2_byte` DP loop that reads the
-  profile, since they share the segment layout.  If both are needed,
-  widen them together in a single pass.
-- Limit yourself to at most 3 search/replace blocks per response.
+- Change at most ONE tightly coupled unit per pass.  If a function
+  (e.g. a profile/lookup-table builder) produces data consumed by
+  another function (e.g. a DP kernel or inner loop), you MUST widen
+  both together in the same pass so the data layout stays consistent.
+  Do NOT leave stride or type mismatches between producer and consumer.
+- Limit yourself to at most 5 search/replace blocks per response.
   If you need more, stop and do the rest in the next pass.
 - Keep your search/replace blocks SHORT — prefer several small blocks
   over one huge block.  Long blocks are more likely to fail matching.
@@ -284,57 +285,85 @@ coupled unit — for example, one function, one loop, or one data structure
 
 ### Key transformations
 
-1. **Vector type**: Replace `__m128i` with native RVV types (e.g.
+1. **Header**: Replace `#include "sse2rvv.h"` with `#include <riscv_vector.h>`.
+   Only do this when ALL `_mm_*` intrinsics in the file have been replaced.
+
+2. **Vector types**: Replace `__m128i` with native RVV types (e.g.
    `vint8m1_t`, `vuint8m1_t`, `vint16m1_t`, etc.) chosen to match the
-   element type used in that context.
+   element type used in that context.  For pointers to vector arrays
+   (e.g. `__m128i*` used for profile/DP storage), change to `uint8_t*`
+   (raw byte arrays with vectors stored contiguously).
 
-2. **Vector length**: Replace hardcoded `16` (bytes per SSE register)
-   with a runtime VLEN query.  Use `__riscv_vsetvlmax_e8m1()` for
-   8-bit elements, `__riscv_vsetvlmax_e16m1()` for 16-bit, etc.
-   Store the result in a `size_t segLen` or similar variable.
+3. **Vector length helpers**: Add small inline helper functions that
+   query the runtime vector length.  For example:
+   ```c
+   static inline size_t vlmax_e8(void)  {{ return __riscv_vsetvlmax_e8m1(); }}
+   static inline size_t vlmax_e16(void) {{ return __riscv_vsetvlmax_e16m1(); }}
+   static inline size_t vregbytes(void) {{ return __riscv_vsetvlmax_e8m1(); }}
+   ```
+   Use these throughout instead of hardcoded constants (16 for byte
+   lanes, 8 for word lanes).
 
-3. **Memory access**: Replace `_mm_load_si128` / `_mm_store_si128` with
-   `__riscv_vle8_v_i8m1(ptr, vl)` / `__riscv_vse8_v_i8m1(ptr, val, vl)`
+4. **Memory access**: Replace `_mm_load_si128` / `_mm_store_si128` with
+   `__riscv_vle8_v_u8m1(ptr, vl)` / `__riscv_vse8_v_u8m1(ptr, val, vl)`
    (or the appropriate element-width variant).
 
-4. **Arithmetic**: Replace `_mm_add_epi8` with `__riscv_vadd_vv_i8m1`,
+5. **Arithmetic**: Replace `_mm_add_epi8` with `__riscv_vadd_vv_i8m1`,
    `_mm_max_epu8` with `__riscv_vmaxu_vv_u8m1`, etc.  Use the RVV
    intrinsic that matches the element type and operation.
 
-5. **Allocation**: Replace `calloc(n, 16)` or `malloc(n * 16)` with
+6. **Allocation**: Replace `calloc(n, 16)` or `malloc(n * 16)` with
    allocation sized to `n * vl` where `vl` is the runtime vector length
    in bytes.
 
-6. **Segment length / loop bounds**: The SSW algorithm uses
-   `segLen = (queryLen + 15) / 16` — update to use the runtime vector
-   length: `segLen = (queryLen + vl - 1) / vl` where `vl` is in
-   element units.
+7. **Segment length / loop bounds**: Where the code uses
+   `segLen = (len + 15) / 16` or `(len + 7) / 8`, update to use the
+   runtime vector length: `segLen = (len + vl - 1) / vl` where `vl`
+   is in element units.
 
-7. **Pointer arithmetic**: Replace `(uint8_t*)ptr + j * 16` with
+8. **Pointer arithmetic**: Replace `(uint8_t*)ptr + j * 16` with
    `(uint8_t*)ptr + j * vl_bytes` where `vl_bytes` is the vector
    register size in bytes.
 
-8. **Shuffles and byte manipulation**: SSE shuffles (`_mm_shuffle_epi8`,
+9. **Shuffles and byte manipulation**: SSE shuffles (`_mm_shuffle_epi8`,
    `_mm_slli_si128`, `_mm_srli_si128`) need careful conversion.  For
    shift-by-N-bytes, use `__riscv_vslideup` / `__riscv_vslidedown`.
    For table lookups, use `__riscv_vrgather`.
 
+10. **Horizontal reductions**: Replace manual tree reductions (macros
+    using repeated `srli` + `max`) with RVV reduction intrinsics:
+    `__riscv_vredmaxu_vs_u8m1_u8m1` (unsigned 8-bit),
+    `__riscv_vredmax_vs_i16m1_i16m1` (signed 16-bit), followed by
+    `__riscv_vmv_x_s_*` to extract the scalar result.
+
+11. **Mask operations**: Replace `_mm_movemask_epi8` patterns with RVV
+    mask intrinsics: `__riscv_vmseq`/`__riscv_vmsgt` to produce masks,
+    `__riscv_vcpop` to count set bits, `__riscv_vfirst` for first set
+    bit.
+
+12. **Mixed signed/unsigned**: For operations that mix signed comparison
+    with unsigned saturating subtract (common in 16-bit paths), use
+    `__riscv_vreinterpret_v_i16m1_u16m1` / `_u16m1_i16m1` to cast
+    between signed and unsigned views of the same vector.
+
 ## Important constraints
 
 - **Correctness first**: The widened code MUST produce identical output
-  to the original 128-bit version.  The Smith-Waterman algorithm is
-  sensitive to how scores are laid out in memory (striped/interleaved
-  pattern).  Changing VLEN changes the stripe width, which changes
-  the memory layout of the scoring profile and DP arrays.
+  to the original 128-bit version.  Algorithms that interleave data
+  across vector lanes (striped/segmented layouts) are especially
+  sensitive — changing VLEN changes the number of lanes, so data layout,
+  profile construction, and any DP recurrence must all be updated
+  consistently.
 
-- **Segment layout**: The SSW library uses a "striped" layout where
-  consecutive query positions are interleaved across vector lanes.
-  When VLEN changes, the number of lanes changes, so the profile
-  construction AND the DP recurrence must both be updated consistently.
+- **Data layout consistency**: If the code uses a segmented/striped
+  memory layout (e.g. interleaving positions across vector lanes),
+  the builder function and the kernel that consumes the layout must
+  use the same vector length.  Widening one without the other will
+  silently corrupt results.
 
-- **Keep sse2rvv.h included**: The header is still needed for any SSE
-  intrinsics that haven't been widened yet.  Only remove it when ALL
-  SSE intrinsics have been replaced.
+- **Keep sse2rvv.h until fully done**: The header is still needed for
+  any SSE intrinsics that haven't been widened yet.  Only remove it
+  when ALL `_mm_*` intrinsics in the file have been replaced.
 
 - **Compile for rv64gcv**: The code must compile with
   `-march=rv64gcv -mabi=lp64d` or `--target=riscv64-linux-gnu -march=rv64imafdcv`.
@@ -352,7 +381,8 @@ has a `RVV-WIDENED` marker.  Focus only on sections that still use
 
 ## Rules
 
-- You may modify both `ssw.h` and `{target_file}` (they are shown concatenated).
+- You may modify both the header and `{target_file}` (they are shown
+  concatenated).
 - Make SMALL incremental changes — do not try to widen everything at once.
 - Each search/replace block should be small and focused.
 - Preserve the algorithm — only change the SIMD layer.
@@ -361,12 +391,14 @@ has a `RVV-WIDENED` marker.  Focus only on sections that still use
 - Double-check every intrinsic name against the cheatsheet above before
   writing it.  Wrong names cause compile failures that waste retries.
 - Do NOT touch functions marked with `RVV-WIDENED`.
+- When renaming functions (e.g. `_sse2_` → `_rvv_`), update ALL call
+  sites in the same pass.
 
 ## Output format
 
 Return only:
 1) A short summary of what you are widening in this pass.
-2) One or more search/replace blocks with the changes (max 3 blocks).
+2) One or more search/replace blocks with the changes (max 5 blocks).
 
 {search_replace_format_example()}
 """.strip()
@@ -395,12 +427,12 @@ intrinsics that process `vl` elements per operation, where `vl` is
 determined at runtime via `__riscv_vsetvlmax_*()`.
 
 **IMPORTANT**: Make a SMALL change — widen ONE tightly coupled unit
-(e.g. one function and its callers' type signatures).  If you widen
-the profile construction (e.g. `qP_byte`), you MUST also update the
-corresponding DP function (`sw_sse2_byte`) in the same pass to use the
-same segment layout.  Do NOT leave type or stride mismatches.
+(e.g. one function and its callers' type signatures).  If a function
+builds a data structure consumed by another function, you MUST widen
+both together so the data layout stays consistent.  Do NOT leave type
+or stride mismatches.
 
-Use at most 3 search/replace blocks.  Keep each block short.
+Use at most 5 search/replace blocks.  Keep each block short.
 Double-check every RVV intrinsic name against the cheatsheet in the
 system prompt before writing it.
 
@@ -416,7 +448,7 @@ Current code:
 
 Output:
 - First, a short summary of what you are widening.
-- Then, one or more search/replace blocks (max 3).
+- Then, one or more search/replace blocks (max 5).
 {search_replace_format_example()}
 """.strip()
 
@@ -437,6 +469,8 @@ RVV intrinsic cheatsheet in the system prompt carefully.  Common mistakes:
 - Missing `_v_` infix in loads: `__riscv_vle8_v_u8m1` (not `__riscv_vle8_u8m1`)
 - Missing `_x_` infix in splats: `__riscv_vmv_v_x_u8m1` (not `__riscv_vmv_v_u8m1`)
 - Missing `vl` parameter: ALL RVV intrinsics require `vl` as last argument
+- Wrong reinterpret direction: `__riscv_vreinterpret_v_i16m1_u16m1` converts
+  i16→u16, `_u16m1_i16m1` converts u16→i16
 
 Context:
 - Target file: {target_file}
@@ -462,12 +496,32 @@ def build_widen_continue_prompt(
     source_code: str,
     build_command: str,
     pass_number: int,
+    validation_feedback: str | None = None,
 ) -> str:
-    return f"""\
+    if validation_feedback:
+        preamble = f"""\
+Task: Continue widening vector operations (pass {pass_number}).
+
+The previous pass had validation errors (shown below).  You MUST fix
+these errors first before attempting any new widening.  Make the
+smallest change that resolves the failure."""
+    else:
+        preamble = f"""\
 Task: Continue widening vector operations (pass {pass_number}).
 
 The previous pass succeeded.  Now widen the next section of the code
-that still uses 128-bit SSE intrinsics via sse2rvv.h.
+that still uses 128-bit SSE intrinsics via sse2rvv.h."""
+
+    validation_section = ""
+    if validation_feedback:
+        validation_section = f"""
+
+Current validation errors (FIX THESE FIRST):
+{validation_feedback}
+"""
+
+    return f"""\
+{preamble}
 
 Skip any function already marked with `/* RVV-WIDENED */` — those are
 done.  Look for remaining `_mm_*` intrinsic calls in unmarked functions
@@ -475,11 +529,18 @@ and replace them with native RVV intrinsics.  After widening a function,
 add the `/* RVV-WIDENED: ... */` marker comment at the top.
 
 If all functions are already marked `RVV-WIDENED` and no `_mm_*` calls
-remain, respond with exactly:
+remain, also:
+- Remove `#include "sse2rvv.h"` from any file that no longer uses SSE
+  intrinsics (replace with `#include <riscv_vector.h>` if not already
+  included, or a comment like `/* RVV-WIDENED: sse2rvv.h no longer needed */`).
+- Update any call sites that reference old function names.
+
+If ALL widening is complete and no `_mm_*` calls remain in any file,
+respond with exactly:
 "ALL_WIDENED: No more SSE intrinsics to widen."
 
-**IMPORTANT**: Make a SMALL change — at most ONE function per pass.
-Use at most 3 search/replace blocks.  Keep each block short.
+**IMPORTANT**: Make a SMALL change — at most ONE tightly coupled unit
+per pass.  Use at most 5 search/replace blocks.  Keep each block short.
 Double-check every RVV intrinsic name against the cheatsheet in the
 system prompt.
 
@@ -491,10 +552,10 @@ Current code:
 ```c
 {source_code}
 ```
-
+{validation_section}
 Output:
 - First, a short summary of what you are widening in this pass.
-- Then, one or more search/replace blocks (max 3).
+- Then, one or more search/replace blocks (max 5).
 {search_replace_format_example()}
 """.strip()
 
@@ -528,6 +589,37 @@ def default_ssh_compile_command() -> str:
 
 def default_ssh_run_command() -> str:
     return "./ssw_test demo/10k.fa demo/54mer_hap1_1.100.fa 2>&1"
+
+
+# ---------------------------------------------------------------------------
+# Auto-detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_target_file(source_dir: Path, file_names: list[str]) -> str:
+    """Find the .c file that contains SSE intrinsics (_mm_*)."""
+    candidates = []
+    for name in file_names:
+        if not name.endswith(".c"):
+            continue
+        content = (source_dir / name).read_text()
+        if "_mm_" in content:
+            candidates.append(name)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        # If multiple .c files have SSE intrinsics, pick the one that is NOT main.c
+        non_main = [c for c in candidates if c != "main.c"]
+        if len(non_main) == 1:
+            return non_main[0]
+        raise ValueError(
+            f"Multiple .c files contain SSE intrinsics: {candidates}. "
+            "Specify target_file explicitly."
+        )
+    raise ValueError(
+        f"No .c file with SSE intrinsics (_mm_*) found in {source_dir}. "
+        "Specify target_file explicitly."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -815,8 +907,8 @@ class WidenAgent:
     def run(
         self,
         source_dir: Path,
-        target_file: str,
         output_dir: Path,
+        target_file: str | None = None,
         build_command: str | None = None,
         ssh_compile_command: str | None = None,
         ssh_run_command: str | None = None,
@@ -827,8 +919,9 @@ class WidenAgent:
 
         Args:
             source_dir: Directory with the 128-bit translated code.
-            target_file: File to widen (e.g. "ssw.c").
             output_dir: Where to write the widened output.
+            target_file: File to widen (e.g. "ssw.c").  If None, auto-detected
+                as the .c file containing ``_mm_`` SSE intrinsics.
             build_command: Docker build+test command. Auto-generated if None.
             ssh_compile_command: SSH compile command. Auto-generated if None.
             ssh_run_command: SSH run command. Auto-generated if None.
@@ -842,11 +935,16 @@ class WidenAgent:
         if ssh_run_command is None:
             ssh_run_command = default_ssh_run_command()
 
-        logger.info("Starting widening for %s in %s", target_file, source_dir)
-
         file_names = [f.name for f in source_dir.iterdir() if f.is_file()]
+
+        # Auto-detect target file if not specified
+        if target_file is None:
+            target_file = _detect_target_file(source_dir, file_names)
+
         if target_file not in file_names:
             raise ValueError(f"Target file {target_file} not found in {source_dir}")
+
+        logger.info("Starting widening for %s in %s", target_file, source_dir)
 
         snapshot = SourceSnapshot(
             files={name: (source_dir / name).read_text() for name in file_names}
@@ -889,7 +987,9 @@ class WidenAgent:
 
             # Main widening loop — each step is one widening pass
             current_snapshot = snapshot
+            last_known_good = snapshot
             successful_passes = 0
+            pending_feedback: str | None = None  # validation errors to feed forward
 
             for step in range(1, max_steps + 1):
                 logger.info("Widening pass %d/%d for %s", step, max_steps, target_file)
@@ -900,6 +1000,7 @@ class WidenAgent:
                         target_file,
                         current_code,
                         build_command,
+                        validation_feedback=pending_feedback,
                     )
                 else:
                     user_content = build_widen_continue_prompt(
@@ -907,6 +1008,7 @@ class WidenAgent:
                         current_code,
                         build_command,
                         pass_number=step,
+                        validation_feedback=pending_feedback,
                     )
 
                 messages = [
@@ -925,26 +1027,29 @@ class WidenAgent:
                 # Check if LLM says everything is widened
                 if latest_validation.stage == "all-widened":
                     logger.info("LLM reports all widening complete after %d pass(es)", successful_passes)
-                    write_output(output_dir, current_snapshot)
+                    write_output(output_dir, last_known_good)
                     return 0
 
                 if repaired_snapshot is None:
                     if latest_validation.stage == "internal-error":
                         logger.warning("Stopping due to unrecoverable error: %s", latest_validation.stderr)
-                        write_output(output_dir, current_snapshot)
+                        write_output(output_dir, last_known_good)
                         return 1
-                    logger.info("Pass %d did not yield a valid candidate, continuing", step)
+                    logger.info("Pass %d did not yield a valid candidate, continuing with pending feedback", step)
+                    pending_feedback = latest_validation.as_feedback() if not latest_validation.ok else None
                     continue
 
                 if not latest_validation.ok:
                     logger.warning(
-                        "Pass %d failed validation; rolling back to last known-good snapshot",
+                        "Pass %d failed Docker/QEMU validation; keeping snapshot and feeding errors forward",
                         step,
                     )
-                    materialize_snapshot(workspaces.workspace_dir, current_snapshot)
+                    current_snapshot = repaired_snapshot
+                    pending_feedback = latest_validation.as_feedback()
                     continue
 
                 # Docker/QEMU passed — try SSH hardware
+                pending_feedback = None
                 if ssh_compile_command and ssh_run_command:
                     ssh_files = [p for p in workspaces.workspace_dir.iterdir()]
                     ssh_result = self.ssh_validator.validate(
@@ -953,10 +1058,11 @@ class WidenAgent:
                     if not ssh_result.ok:
                         logger.warning(
                             "Pass %d passed QEMU but failed SSH at stage %s; "
-                            "rolling back to last known-good snapshot\n%s",
+                            "keeping snapshot and feeding errors forward\n%s",
                             step, ssh_result.stage, ssh_result.combined_output,
                         )
-                        materialize_snapshot(workspaces.workspace_dir, current_snapshot)
+                        current_snapshot = repaired_snapshot
+                        pending_feedback = ssh_result.as_feedback()
                         continue
 
                     # SSH passed — correctness check
@@ -964,14 +1070,16 @@ class WidenAgent:
                     if correctness is not None and not correctness.ok:
                         logger.warning(
                             "Pass %d passed SSH but failed correctness; "
-                            "rolling back to last known-good snapshot\n%s",
+                            "keeping snapshot and feeding errors forward\n%s",
                             step, correctness.combined_output,
                         )
-                        materialize_snapshot(workspaces.workspace_dir, current_snapshot)
+                        current_snapshot = repaired_snapshot
+                        pending_feedback = correctness.as_feedback()
                         continue
 
                 # This pass fully validated
                 current_snapshot = repaired_snapshot
+                last_known_good = repaired_snapshot
                 successful_passes += 1
 
                 # Measure speedup vs original translated code
@@ -1000,7 +1108,7 @@ class WidenAgent:
                 "Widening completed after %d step(s) (%d successful passes)",
                 max_steps, successful_passes,
             )
-            write_output(output_dir, current_snapshot)
+            write_output(output_dir, last_known_good)
             return 0 if successful_passes > 0 else 1
 
         finally:
@@ -1024,17 +1132,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory with translated 128-bit code (default: translations/sequence-alignment/)",
     )
     parser.add_argument(
-        "target_file",
-        nargs="?",
-        default="ssw.c",
-        help="File to widen (default: ssw.c)",
-    )
-    parser.add_argument(
         "output_dir",
         type=Path,
         nargs="?",
         default=PROJECT_DIR / "widened",
         help="Directory for widened output (default: widened/)",
+    )
+    parser.add_argument(
+        "--target-file",
+        default=None,
+        help="File to widen (default: auto-detect .c file with SSE intrinsics)",
     )
     parser.add_argument(
         "--build-command",
@@ -1071,8 +1178,8 @@ def main() -> int:
     args = parse_args()
     return WidenAgent().run(
         source_dir=args.source_dir,
-        target_file=args.target_file,
         output_dir=args.output_dir,
+        target_file=args.target_file,
         build_command=args.build_command,
         ssh_compile_command=args.ssh_compile,
         ssh_run_command=args.ssh_run,

@@ -122,7 +122,7 @@ def test_build_widen_system_prompt_structure():
     assert "<<<<<<< SEARCH" in prompt
     assert ">>>>>>> REPLACE" in prompt
     assert "__riscv_vsetvlmax" in prompt
-    assert "ssw.h" in prompt and "ssw.c" in prompt
+    assert "the header" in prompt and "ssw.c" in prompt
 
 
 def test_build_widen_initial_prompt_structure():
