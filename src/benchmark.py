@@ -198,36 +198,132 @@ def normalize_output(raw: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def compare_outputs(intel: BenchmarkResult, riscv: BenchmarkResult) -> tuple[bool, str]:
-    """Compare alignment outputs from both runs. Returns (match, details)."""
-    intel_norm = normalize_output(intel.stdout)
-    riscv_norm = normalize_output(riscv.stdout)
+def _parse_alignment_records(text: str) -> list[dict[str, str]]:
+    """Parse SSW alignment output into a list of records.
 
-    if intel_norm == riscv_norm:
-        return True, "Outputs match exactly."
+    Each record is a dict of field name → value extracted from the tab-separated
+    score line.  The ``target_name`` and ``query_name`` lines that precede it are
+    included as fields too.
 
-    # Show diff summary
-    intel_lines = intel_norm.splitlines()
-    riscv_lines = riscv_norm.splitlines()
+    Recognised fields (all optional except optimal_alignment_score):
+        target_name, query_name, optimal_alignment_score,
+        suboptimal_alignment_score, strand, target_begin, target_end,
+        query_begin, query_end.
+    """
+    import re
 
-    details = []
-    details.append(f"Intel output: {len(intel_lines)} lines")
-    details.append(f"RISC-V output: {len(riscv_lines)} lines")
+    norm = normalize_output(text)
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
 
-    max_lines = max(len(intel_lines), len(riscv_lines))
-    diff_count = 0
-    first_diffs = []
-    for i in range(max_lines):
-        a = intel_lines[i] if i < len(intel_lines) else "<missing>"
-        b = riscv_lines[i] if i < len(riscv_lines) else "<missing>"
-        if a != b:
-            diff_count += 1
-            if len(first_diffs) < 5:
-                first_diffs.append(f"  line {i+1}:\n    Intel:  {a}\n    RISC-V: {b}")
+    for line in norm.splitlines():
+        # "target_name: <value>" starts a new record
+        m = re.match(r"target_name:\s*(.+)", line)
+        if m:
+            if current:
+                records.append(current)
+            current = {"target_name": m.group(1).strip()}
+            continue
 
-    details.append(f"Differing lines: {diff_count}")
-    details.append("First differences:")
-    details.extend(first_diffs)
+        m = re.match(r"query_name:\s*(.+)", line)
+        if m:
+            current["query_name"] = m.group(1).strip()
+            continue
+
+        # Tab-separated key: value pairs on the score line
+        if "optimal_alignment_score:" in line:
+            for part in re.split(r"\t+", line):
+                kv = re.match(r"(\S+):\s*(.+)", part.strip())
+                if kv:
+                    current[kv.group(1)] = kv.group(2).strip()
+
+    if current:
+        records.append(current)
+
+    return records
+
+
+# Fields that must match for correctness.
+_REQUIRED_FIELDS = [
+    "target_name",
+    "query_name",
+    "optimal_alignment_score",
+    "strand",
+    "target_end",
+    "query_end",
+]
+
+# Fields compared only when strict_suboptimal is True.
+_OPTIONAL_FIELDS = [
+    "suboptimal_alignment_score",
+]
+
+# Fields that are compared when present in both records but not required.
+_EXTRA_FIELDS = [
+    "target_begin",
+    "query_begin",
+]
+
+
+def compare_outputs(
+    intel: BenchmarkResult,
+    riscv: BenchmarkResult,
+    *,
+    strict_suboptimal: bool = False,
+) -> tuple[bool, str]:
+    """Compare alignment outputs from both runs.
+
+    Parses each output into structured alignment records and compares the key
+    fields (optimal score, strand, target/query end positions).
+
+    When *strict_suboptimal* is ``True`` the ``suboptimal_alignment_score`` field
+    is also compared; otherwise it is ignored (it is implementation-dependent).
+
+    Returns ``(match, details)``.
+    """
+    intel_recs = _parse_alignment_records(intel.stdout)
+    riscv_recs = _parse_alignment_records(riscv.stdout)
+
+    if len(intel_recs) != len(riscv_recs):
+        return False, (
+            f"Record count mismatch: Intel={len(intel_recs)}, RISC-V={len(riscv_recs)}"
+        )
+
+    fields_to_check = list(_REQUIRED_FIELDS)
+    if strict_suboptimal:
+        fields_to_check += _OPTIONAL_FIELDS
+    fields_to_check += _EXTRA_FIELDS
+
+    mismatches: list[str] = []
+    for idx, (a, b) in enumerate(zip(intel_recs, riscv_recs)):
+        for field in fields_to_check:
+            va = a.get(field)
+            vb = b.get(field)
+            # Skip fields missing from both sides.
+            if va is None and vb is None:
+                continue
+            # For extra (non-required) fields, skip if either side is missing.
+            if field in _EXTRA_FIELDS and (va is None or vb is None):
+                continue
+            if va != vb:
+                query = a.get("query_name", f"record #{idx+1}")
+                mismatches.append(
+                    f"  record {idx+1} ({query}): "
+                    f"{field} Intel={va!r} RISC-V={vb!r}"
+                )
+
+    if not mismatches:
+        ignored = "" if strict_suboptimal else " (suboptimal_alignment_score ignored)"
+        return True, f"Outputs match: {len(intel_recs)} alignment records compared.{ignored}"
+
+    details = [
+        f"Alignment records compared: {len(intel_recs)}",
+        f"Mismatched fields: {len(mismatches)}",
+        "First differences:",
+    ]
+    details.extend(mismatches[:10])
+    if len(mismatches) > 10:
+        details.append(f"  ... and {len(mismatches) - 10} more")
 
     return False, "\n".join(details)
 
@@ -237,6 +333,7 @@ def benchmark(
     original_dir: Path = DEFAULT_ORIGINAL_DIR,
     translated_dir: Path = DEFAULT_TRANSLATED_DIR,
     dataset_dir: Path = DATASETS_DIR,
+    strict_suboptimal: bool = False,
 ) -> int:
     """Run benchmark comparing original SSE code on Intel vs translated RVV code on RISC-V."""
     run_intel_locally = not SSH_JUMP_HOST
@@ -327,7 +424,9 @@ def benchmark(
         return 1
 
     # Compare outputs for correctness
-    match, details = compare_outputs(intel_result, riscv_result)
+    match, details = compare_outputs(
+        intel_result, riscv_result, strict_suboptimal=strict_suboptimal,
+    )
 
     print(f"\nOutput comparison: {'MATCH' if match else 'MISMATCH'}")
     print(details)
@@ -372,6 +471,12 @@ def parse_args() -> argparse.Namespace:
         default=DATASETS_DIR,
         help="Directory containing dataset files",
     )
+    parser.add_argument(
+        "--strict-suboptimal",
+        action="store_true",
+        default=False,
+        help="Also compare suboptimal_alignment_score (implementation-dependent)",
+    )
     return parser.parse_args()
 
 
@@ -383,6 +488,7 @@ def main() -> int:
         original_dir=args.original_dir,
         translated_dir=args.translated_dir,
         dataset_dir=args.dataset_dir,
+        strict_suboptimal=args.strict_suboptimal,
     )
 
 

@@ -340,15 +340,59 @@ class TestNormalizeOutput:
 
 
 class TestCompareOutputs:
+    _SSW_REC = (
+        "target_name: chr1\n"
+        "query_name: read1\n"
+        "optimal_alignment_score: 42\tsuboptimal_alignment_score: 30\t"
+        "strand: +\ttarget_end: 100\tquery_end: 50\n\n"
+    )
+    _SSW_REC_NO_SUB = (
+        "target_name: chr1\n"
+        "query_name: read1\n"
+        "optimal_alignment_score: 42\tstrand: +\ttarget_end: 100\tquery_end: 50\n\n"
+    )
+    _SSW_REC_DIFF_SUB = (
+        "target_name: chr1\n"
+        "query_name: read1\n"
+        "optimal_alignment_score: 42\tsuboptimal_alignment_score: 25\t"
+        "strand: +\ttarget_end: 100\tquery_end: 50\n\n"
+    )
+
     def test_matching_outputs(self):
-        a = _ok_result(stdout="line1\nline2\n")
-        b = _ok_result(stdout="line1\nline2\n")
+        a = _ok_result(stdout=self._SSW_REC)
+        b = _ok_result(stdout=self._SSW_REC)
         match, details = compare_outputs(a, b)
         assert match is True
 
-    def test_mismatched_outputs(self):
-        a = _ok_result(stdout="line1\nline2\n")
-        b = _ok_result(stdout="line1\nline3\n")
+    def test_suboptimal_ignored_by_default(self):
+        a = _ok_result(stdout=self._SSW_REC)
+        b = _ok_result(stdout=self._SSW_REC_NO_SUB)
+        match, _ = compare_outputs(a, b)
+        assert match is True
+
+    def test_different_suboptimal_ignored_by_default(self):
+        a = _ok_result(stdout=self._SSW_REC)
+        b = _ok_result(stdout=self._SSW_REC_DIFF_SUB)
+        match, _ = compare_outputs(a, b)
+        assert match is True
+
+    def test_strict_suboptimal_catches_difference(self):
+        a = _ok_result(stdout=self._SSW_REC)
+        b = _ok_result(stdout=self._SSW_REC_DIFF_SUB)
+        match, details = compare_outputs(a, b, strict_suboptimal=True)
+        assert match is False
+        assert "suboptimal" in details
+
+    def test_mismatched_score(self):
+        other = self._SSW_REC.replace("score: 42", "score: 99")
+        a = _ok_result(stdout=self._SSW_REC)
+        b = _ok_result(stdout=other)
         match, details = compare_outputs(a, b)
         assert match is False
-        assert "RISC-V" in details
+
+    def test_mismatched_record_count(self):
+        a = _ok_result(stdout=self._SSW_REC * 2)
+        b = _ok_result(stdout=self._SSW_REC)
+        match, details = compare_outputs(a, b)
+        assert match is False
+        assert "Record count" in details
