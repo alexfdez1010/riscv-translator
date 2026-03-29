@@ -1,4 +1,4 @@
-.PHONY: all sync test translate check benchmark clean
+.PHONY: all sync test translate check benchmark widen clean
 
 all: sync
 
@@ -21,6 +21,12 @@ check:
 BENCHMARK_DATASET ?= 1M.fa
 benchmark:
 	uv run python -m src.benchmark --dataset $(BENCHMARK_DATASET)
+
+WIDEN_SOURCE_DIR ?= translations/sequence-alignment
+WIDEN_TARGET_FILE ?= ssw.c
+WIDEN_OUTPUT_DIR ?= widened
+widen:
+	uv run python -m src.widen $(WIDEN_SOURCE_DIR) $(WIDEN_TARGET_FILE) $(WIDEN_OUTPUT_DIR)
 
 clean:
 	rm -rf __pycache__ .pytest_cache

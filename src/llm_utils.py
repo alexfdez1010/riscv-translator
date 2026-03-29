@@ -6,7 +6,6 @@ from urllib.request import Request, urlopen
 from src.llm_types import LLM, Message, llm_fn
 
 from src.config import (
-    LLM_MAX_COMPLETION_TOKENS,
     LLM_TEMPERATURE,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
@@ -73,7 +72,6 @@ def create_llm() -> LLM:
                 for message in messages
             ],
             "temperature": LLM_TEMPERATURE,
-            "max_completion_tokens": LLM_MAX_COMPLETION_TOKENS,
         }
         return _extract_content(_call_openrouter(payload))
 
