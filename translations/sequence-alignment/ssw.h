@@ -6,6 +6,9 @@
  *	Version 1.2.3
  *	Last revision by Mengyao Zhao on 2022-May-24.
  *
+ *  Modified by Alejandro Fernandez Camello (2025).
+ *  x86 SSE SIMD intrinsics translated to RISC-V Vector (RVV) extensions
+ *  via sse2rvv.h compatibility layer using an LLM-driven automated pipeline.
  */
 
 #ifndef SSW_H

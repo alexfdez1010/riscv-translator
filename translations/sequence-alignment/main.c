@@ -2,6 +2,11 @@
  *  Created by Mengyao Zhao on 06/23/11.
  *	Version 1.2.6
  *  Last revision by Mengyao Zhao on 2025-09-02.
+ *
+ *  Modified by Alejandro Fernandez Camello (2025).
+ *  x86 SSE SIMD intrinsics translated to RISC-V Vector (RVV) extensions
+ *  via sse2rvv.h compatibility layer using an LLM-driven automated pipeline.
+ *  zlib dependency replaced with standard C file I/O.
  */
 
 #include <stdlib.h>

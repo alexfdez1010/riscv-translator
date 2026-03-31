@@ -6,6 +6,9 @@
  *	Version 1.2.3
  *	Last revision by Mengyao Zhao on 2022-May-24.
  *
+ *  Modified by Alejandro Fernandez Camello (2025).
+ *  x86 SSE SIMD intrinsics rewritten to native RISC-V Vector (RVV)
+ *  intrinsics (<riscv_vector.h>), making the code VLEN-agnostic.
  */
 
 #ifndef SSW_H

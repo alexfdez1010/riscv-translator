@@ -64,6 +64,10 @@
  *
  *  The core SW loop referenced the swsse2 implementation, which is
  *  BSD licensed under Micharl Farrar.
+ *
+ *  Modified by Alejandro Fernandez Camello (2025).
+ *  x86 SSE SIMD intrinsics translated to RISC-V Vector (RVV) extensions
+ *  via sse2rvv.h compatibility layer using an LLM-driven automated pipeline.
  */
 
 #include <stdint.h>
