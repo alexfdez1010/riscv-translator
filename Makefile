@@ -1,4 +1,4 @@
-.PHONY: all sync test translate check benchmark widen clean
+.PHONY: all sync test translate check benchmark widen graph clean
 
 all: sync
 
@@ -27,6 +27,9 @@ WIDEN_SOURCE_DIR ?= translations/sequence-alignment
 WIDEN_OUTPUT_DIR ?= widened
 widen:
 	uv run python -m src.widen $(WIDEN_SOURCE_DIR) $(WIDEN_OUTPUT_DIR)
+
+graph:
+	uv run python -m src.graph
 
 clean:
 	rm -rf __pycache__ .pytest_cache
