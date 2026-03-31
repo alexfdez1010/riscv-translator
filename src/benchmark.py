@@ -9,6 +9,9 @@ Each (code_variant, dataset) pair is run 10 times.  Results are deduplicated
 and written to benchmarks.csv.  Correctness is validated against the original
 SSE code (initial_code) on Intel.
 
+Incremental mode: experiments already present in the CSV are skipped.  SSE
+reference outputs are cached per dataset to avoid recomputation.
+
 Usage:
     uv run python -m src.benchmark
 """
@@ -318,6 +321,21 @@ def validate_output(ref_stdout: str, test_stdout: str) -> tuple[bool, str]:
 # CSV writing
 # ---------------------------------------------------------------------------
 
+def read_csv(csv_path: Path) -> set[tuple[str, str]]:
+    """Return the set of (code_variant, dataset) pairs already stored in CSV."""
+    stored: set[tuple[str, str]] = set()
+    if not csv_path.exists():
+        return stored
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            variant = row.get("code_variant", "")
+            dataset = row.get("dataset", "")
+            if variant and dataset:
+                stored.add((variant, dataset))
+    return stored
+
+
 def write_csv(
     results: dict[tuple[str, str], dict],
     csv_path: Path,
@@ -346,9 +364,107 @@ def write_csv(
         writer.writerows(rows)
 
 
+def merge_csv(
+    new_results: dict[tuple[str, str], dict],
+    csv_path: Path,
+    max_runs: int,
+) -> None:
+    """Read existing CSV rows, merge with new results, and rewrite."""
+    existing_rows: list[list[str]] = []
+    existing_keys: set[tuple[str, str]] = set()
+    run_cols = [f"run_{i + 1}" for i in range(max_runs)]
+    header = (
+        ["code_variant", "dataset", "n_runs"]
+        + run_cols
+        + ["mean", "median", "min", "max", "stdev", "q1", "q3", "iqr", "correct"]
+    )
+
+    if csv_path.exists():
+        with open(csv_path, newline="") as f:
+            reader = csv.reader(f)
+            file_header = next(reader, None)
+            # Determine how many run columns the existing file has
+            existing_max_runs = 0
+            if file_header:
+                existing_max_runs = sum(1 for h in file_header if h.startswith("run_"))
+            for row in reader:
+                variant = row[0] if len(row) > 0 else ""
+                dataset = row[1] if len(row) > 1 else ""
+                key = (variant, dataset)
+                if key in new_results:
+                    continue  # new results override
+                existing_keys.add(key)
+                # Pad or trim run columns to match max_runs
+                n_runs = int(row[2]) if len(row) > 2 else 0
+                run_values = row[3:3 + existing_max_runs]
+                padded_runs = run_values[:max_runs] + [""] * max(0, max_runs - len(run_values))
+                stat_values = row[3 + existing_max_runs:3 + existing_max_runs + 8]
+                correct = row[3 + existing_max_runs + 8] if len(row) > 3 + existing_max_runs + 8 else ""
+                rebuilt = [variant, dataset, str(n_runs)] + padded_runs + stat_values + [correct]
+                existing_rows.append(rebuilt)
+
+    # Build new rows
+    new_rows: list[list[str]] = []
+    for (variant, ds), data in sorted(new_results.items()):
+        st = data["stats"]
+        row: list[str] = [variant, ds, str(st["n_runs"])]
+        for i in range(max_runs):
+            row.append(f"{st['times'][i]:.6f}" if i < st["n_runs"] else "")
+        for k in ["mean", "median", "min", "max", "stdev", "q1", "q3", "iqr"]:
+            row.append(f"{st[k]:.6f}")
+        row.append(str(data.get("correct", "")))
+        new_rows.append(row)
+
+    all_rows = sorted(existing_rows + new_rows, key=lambda r: (r[0], r[1]))
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(all_rows)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _get_sse_reference(
+    jump_host: str,
+    intel_remote: str,
+    dataset: str,
+    *,
+    cache: dict[str, str],
+    compiled: list[bool],
+) -> str | None:
+    """Return SSE reference stdout for *dataset*, using cache to avoid recomputation.
+
+    *compiled* is a one-element list used as a mutable flag to track whether the
+    SSE reference has already been uploaded and compiled on the Intel host.
+    """
+    if dataset in cache:
+        return cache[dataset]
+
+    # Upload & compile SSE reference once
+    if not compiled[0]:
+        intel_dir = PROJECT_DIR / "initial_code"
+        src_files = [p for p in intel_dir.iterdir() if p.is_file()]
+        logger.info("Uploading SSE reference to %s ...", jump_host)
+        if not upload(jump_host, intel_remote, src_files):
+            return None
+        if not compile_on_host(jump_host, intel_remote, INTEL_COMPILE, "SSE ref"):
+            return None
+        compiled[0] = True
+
+    if not upload_dataset(jump_host, intel_remote, DATASETS_DIR, dataset):
+        return None
+    run_cmd = f"./ssw_test demo/{dataset} demo/{REFERENCE_FILE} 2>&1"
+    _, ref_stdout, ok = run_once(jump_host, intel_remote, run_cmd)
+    if not ok:
+        logger.warning("SSE ref run failed for %s", dataset)
+        return None
+    logger.info("SSE reference for %s: OK", dataset)
+    cache[dataset] = ref_stdout
+    return ref_stdout
+
 
 def main() -> int:
     configure_logging(level="INFO")
@@ -368,28 +484,44 @@ def main() -> int:
     else:
         logger.warning("No Intel host — skipping SSE validation")
 
-    # --- Phase 1: RISC-V benchmarks ---
+    # --- Load already-stored experiments from CSV ---
+    stored = read_csv(CSV_PATH)
+    if stored:
+        logger.info("CSV already contains %d experiment(s) — will skip them", len(stored))
+
+    # --- Run experiments ---
     results: dict[tuple[str, str], dict] = {}
-    all_datasets: set[str] = set()
+    sse_cache: dict[str, str] = {}
+    sse_compiled: list[bool] = [False]
+    intel_remote = f"{REMOTE_DIR}-paper-sse-ref"
+
+    # Track which variants have been uploaded/compiled on RISC-V
+    compiled_variants: set[str] = set()
 
     for variant, datasets in EXPERIMENT_PLAN.items():
         source_dir = PROJECT_DIR / VARIANTS[variant]
         remote_dir = f"{REMOTE_DIR}-paper-{variant}"
 
-        # Upload source
-        src_items = list(source_dir.iterdir())
-        logger.info("Uploading %s ...", variant)
-        if not upload(final_host, remote_dir, src_items):
-            return 1
-
-        # Compile once
-        if not compile_on_host(final_host, remote_dir, RISCV_COMPILE, variant):
-            return 1
-        logger.info("Compiled %s OK", variant)
-
-        # Run each dataset
         for ds in datasets:
-            all_datasets.add(ds)
+            key = (variant, ds)
+
+            # Skip if already in CSV
+            if key in stored:
+                logger.info("SKIP %s | %s — already in CSV", variant, ds)
+                continue
+
+            # Upload & compile variant (once per variant)
+            if variant not in compiled_variants:
+                src_items = list(source_dir.iterdir())
+                logger.info("Uploading %s ...", variant)
+                if not upload(final_host, remote_dir, src_items):
+                    return 1
+                if not compile_on_host(final_host, remote_dir, RISCV_COMPILE, variant):
+                    return 1
+                logger.info("Compiled %s OK", variant)
+                compiled_variants.add(variant)
+
+            # Upload dataset
             if not upload_dataset(final_host, remote_dir, DATASETS_DIR, ds):
                 return 1
 
@@ -413,47 +545,43 @@ def main() -> int:
                 logger.error("All runs failed for %s", label)
                 return 1
 
-            results[(variant, ds)] = {
+            # --- SSE correctness validation ---
+            correct: bool | str = ""
+            if has_intel:
+                ref_stdout = _get_sse_reference(
+                    jump_host, intel_remote, ds,
+                    cache=sse_cache, compiled=sse_compiled,
+                )
+                if ref_stdout is not None:
+                    match, details = validate_output(ref_stdout, first_stdout)
+                    correct = match
+                    status = "PASS" if match else "FAIL"
+                    logger.info("  Validation %s | %s: %s — %s", variant, ds, status, details)
+                    if not match:
+                        logger.error(
+                            "SKIP storing %s | %s — correctness FAIL: %s",
+                            variant, ds, details,
+                        )
+                        continue
+                else:
+                    logger.warning("Could not obtain SSE reference for %s — storing without validation", ds)
+
+            results[key] = {
                 "stats": _stats_row(times, RUNS),
                 "stdout": first_stdout,
+                "correct": correct,
             }
 
-    # --- Phase 2: SSE validation ---
-    if has_intel:
-        intel_dir = PROJECT_DIR / "initial_code"
-        intel_remote = f"{REMOTE_DIR}-paper-sse-ref"
-
-        src_files = [p for p in intel_dir.iterdir() if p.is_file()]
-        logger.info("Uploading SSE reference to %s ...", jump_host)
-        if upload(jump_host, intel_remote, src_files) and compile_on_host(
-            jump_host, intel_remote, INTEL_COMPILE, "SSE ref"
-        ):
-            for ds in sorted(all_datasets):
-                if not upload_dataset(jump_host, intel_remote, DATASETS_DIR, ds):
-                    continue
-                run_cmd = f"./ssw_test demo/{ds} demo/{REFERENCE_FILE} 2>&1"
-                _, ref_stdout, ok = run_once(jump_host, intel_remote, run_cmd)
-                if not ok:
-                    logger.warning("SSE ref run failed for %s", ds)
-                    continue
-                logger.info("SSE reference for %s: OK", ds)
-
-                # Validate all variants that used this dataset
-                for (v, d), data in results.items():
-                    if d != ds:
-                        continue
-                    match, details = validate_output(ref_stdout, data["stdout"])
-                    data["correct"] = match
-                    status = "PASS" if match else "FAIL"
-                    logger.info("  Validation %s | %s: %s — %s", v, ds, status, details)
-
-    # --- Phase 3: Write CSV ---
-    write_csv(results, CSV_PATH, RUNS)
+    # --- Write CSV (merge with existing) ---
+    if results:
+        merge_csv(results, CSV_PATH, RUNS)
 
     # --- Summary ---
     print("\n" + "=" * 80)
     print("PAPER BENCHMARK RESULTS")
     print("=" * 80)
+    if not results:
+        print("  (no new experiments — all already in CSV)")
     for (variant, ds), data in sorted(results.items()):
         st = data["stats"]
         correct = data.get("correct", "")

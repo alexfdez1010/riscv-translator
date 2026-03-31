@@ -12,8 +12,10 @@ from src.benchmark import (
     _percentile,
     _stats_row,
     compare_outputs,
+    merge_csv,
     normalize_output,
     prepare_local_dir,
+    read_csv,
     run_locally,
     run_on_host,
     validate_output,
@@ -221,3 +223,103 @@ class TestRunOnHost:
         mock_compile.return_value = False
         result = run_on_host("host", "/dir", "gcc bad.c", "./a.out", "test")
         assert result.ok is False
+
+
+# ---------------------------------------------------------------------------
+# read_csv — incremental skip
+# ---------------------------------------------------------------------------
+
+class TestReadCSV:
+    def test_reads_existing_keys(self, tmp_path):
+        csv_path = tmp_path / "bench.csv"
+        results = {
+            ("variant-a", "1k.fa"): {
+                "stats": _stats_row([1.0, 2.0], 2),
+                "correct": True,
+            },
+            ("variant-b", "10k.fa"): {
+                "stats": _stats_row([3.0], 1),
+                "correct": False,
+            },
+        }
+        write_csv(results, csv_path, 2)
+        stored = read_csv(csv_path)
+        assert stored == {("variant-a", "1k.fa"), ("variant-b", "10k.fa")}
+
+    def test_empty_file(self, tmp_path):
+        csv_path = tmp_path / "empty.csv"
+        assert read_csv(csv_path) == set()
+
+    def test_nonexistent_file(self, tmp_path):
+        csv_path = tmp_path / "nope.csv"
+        assert read_csv(csv_path) == set()
+
+
+# ---------------------------------------------------------------------------
+# merge_csv — merging new results with existing CSV
+# ---------------------------------------------------------------------------
+
+class TestMergeCSV:
+    def test_merge_adds_new_rows(self, tmp_path):
+        csv_path = tmp_path / "merge.csv"
+        # Write initial data
+        initial = {
+            ("variant-a", "1k.fa"): {
+                "stats": _stats_row([1.0, 2.0, 3.0], 3),
+                "correct": True,
+            },
+        }
+        write_csv(initial, csv_path, 3)
+
+        # Merge new data
+        new = {
+            ("variant-b", "10k.fa"): {
+                "stats": _stats_row([4.0, 5.0, 6.0], 3),
+                "correct": True,
+            },
+        }
+        merge_csv(new, csv_path, 3)
+
+        stored = read_csv(csv_path)
+        assert ("variant-a", "1k.fa") in stored
+        assert ("variant-b", "10k.fa") in stored
+
+    def test_merge_overwrites_existing_key(self, tmp_path):
+        csv_path = tmp_path / "overwrite.csv"
+        initial = {
+            ("variant-a", "1k.fa"): {
+                "stats": _stats_row([1.0], 1),
+                "correct": True,
+            },
+        }
+        write_csv(initial, csv_path, 3)
+
+        # Merge with same key — should overwrite
+        new = {
+            ("variant-a", "1k.fa"): {
+                "stats": _stats_row([9.0, 8.0, 7.0], 3),
+                "correct": True,
+            },
+        }
+        merge_csv(new, csv_path, 3)
+
+        # Verify only one entry for that key
+        import csv as csv_mod
+        with open(csv_path) as f:
+            rows = list(csv_mod.DictReader(f))
+        matching = [r for r in rows if r["code_variant"] == "variant-a" and r["dataset"] == "1k.fa"]
+        assert len(matching) == 1
+        assert matching[0]["n_runs"] == "3"
+
+    def test_merge_creates_file_if_missing(self, tmp_path):
+        csv_path = tmp_path / "new.csv"
+        new = {
+            ("variant-x", "100k.fa"): {
+                "stats": _stats_row([2.0, 3.0], 2),
+                "correct": True,
+            },
+        }
+        merge_csv(new, csv_path, 2)
+
+        stored = read_csv(csv_path)
+        assert ("variant-x", "100k.fa") in stored
