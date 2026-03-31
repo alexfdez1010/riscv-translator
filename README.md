@@ -63,7 +63,9 @@ SSE source code (input directory)
 
 ## Cost
 
-With the recommended model (`minimax/minimax-m2.7` via [OpenRouter](https://openrouter.ai/)), a full translation run of the SSW library costs approximately **$0.05 USD** (5 cents). The typical run completes in 3-8 LLM iterations.
+The first part of the pipeline (Phase 1) costs approximately **$0.05 USD** (5 cents) using the recommended model (`minimax/minimax-m2.7` via [OpenRouter](https://openrouter.ai/)). The typical run completes in 3-8 LLM iterations. The second part has a similar cost of around **$0.05 USD** (5 cents) using the same model.
+
+As the LLMs are non-deterministic, the cost may vary depending on the number of iterations required to produce a working translation. However, using the recommended model, the cost is expected to remain low due to the cost of each iteration (around $0.01 USD).
 
 ## Vector Width and Future Optimization
 
