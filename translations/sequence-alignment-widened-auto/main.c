@@ -19,11 +19,6 @@
 #include "ssw.h"
 #include "kseq.h"
 
-#ifdef __ARM_NEON // (M1)
-#include "sse2neon.h"
-#else // x86 (Intel)
-#include "sse2rvv.h"
-#endif
 
 
 #ifdef __GNUC__

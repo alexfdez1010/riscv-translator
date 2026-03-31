@@ -156,9 +156,36 @@ The pipeline will:
 
 ### Validate a Previous Translation
 
+`make check` validates a translated output directory by:
+
+1. **SSE reference**: running the original x86 SSE code on Intel to obtain reference output.
+2. **Simulator VLEN sweep**: compiling and running the translation under the Spike simulator at every power-of-2 VLEN from 128 up to the maximum (default 4096), comparing each run's output against the SSE reference.
+3. **SSH hardware validation**: compiling and running on real RISC-V hardware via SSH and comparing against the SSE reference.
+
+This ensures the translation produces correct results across all supported vector widths, not just the width of the target hardware.
+
 ```bash
+# Phase 1 translation (sse2rvv.h, fixed 128-bit)
 make check OUTPUT_DIR=translations/sequence-alignment
+
+# Phase 2 manual widening (native RVV, VLEN-agnostic)
+make check OUTPUT_DIR=translations/sequence-alignment-widened
+
+# Phase 2 automated widening (native RVV, VLEN-agnostic)
+make check OUTPUT_DIR=translations/sequence-alignment-widened-auto
 ```
+
+You can customise the sweep range and dataset:
+
+```bash
+# Test up to VLEN=2048 with a larger dataset
+make check OUTPUT_DIR=translations/sequence-alignment-widened-auto MAX_VLEN=2048 CHECK_DATASET=1M.fa
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_VLEN` | `4096` | Highest VLEN to test (powers of 2, Spike maximum is 4096) |
+| `CHECK_DATASET` | `10k.fa` | FASTA dataset used for the check run |
 
 ### Run Benchmarks
 

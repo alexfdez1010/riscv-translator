@@ -77,8 +77,10 @@ class DockerValidator:
         self,
         workspace_dir: Path,
         build_command: str,
+        timeout: int | None = None,
     ) -> ValidationResult:
-        logger.debug("Running Docker validation in %s", workspace_dir)
+        effective_timeout = timeout if timeout is not None else VALIDATION_TIMEOUT_SECONDS
+        logger.debug("Running Docker validation in %s (timeout=%ds)", workspace_dir, effective_timeout)
         try:
             result = subprocess.run(
                 [
@@ -96,7 +98,7 @@ class DockerValidator:
                 ],
                 capture_output=True,
                 text=True,
-                timeout=VALIDATION_TIMEOUT_SECONDS,
+                timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired as exc:
             raw_out = getattr(exc, "stdout", b"") or b""

@@ -15,8 +15,10 @@ OUTPUT_DIR  ?= output
 translate:
 	uv run python -m src.repair $(SOURCE_DIR) $(TARGET_FILE) $(OUTPUT_DIR)
 
+MAX_VLEN     ?= 4096
+CHECK_DATASET ?= 10k.fa
 check:
-	uv run python -m src.check $(OUTPUT_DIR)
+	uv run python -m src.check $(OUTPUT_DIR) --max-vlen $(MAX_VLEN) --dataset $(CHECK_DATASET)
 
 BENCHMARK_DATASET ?= 1M.fa
 benchmark:
