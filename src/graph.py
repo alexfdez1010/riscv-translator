@@ -171,24 +171,13 @@ def boxplot_combined(rows):
 
         _styled_boxplot(ax, data, colors, width=0.55)
 
-        # Log scale with explicit, readable tick values
-        ax.set_yscale("log")
-        ax.yaxis.set_major_formatter(ticker.FuncFormatter(
-            lambda y, _: f"{y:g}"))
-        ax.yaxis.set_minor_formatter(ticker.FuncFormatter(
-            lambda y, _: f"{y:g}"))
-        ax.tick_params(axis="y", which="minor", labelsize=8, labelcolor="#7F8C8D")
-        ax.tick_params(axis="y", which="major", labelsize=10)
-        ax.grid(axis="y", which="minor", color=GRID_COLOR, linewidth=0.4, alpha=0.5)
-        ax.grid(axis="y", which="major", color=GRID_COLOR, linewidth=0.6, alpha=0.8)
-
         # X-tick labels: short variant names
         short_labels = []
         for v in variants:
             if ds in vdata[v]:
                 short_labels.append(VARIANT_LABELS[v])
         ax.set_xticklabels(short_labels, rotation=30, ha="right", fontsize=8.5)
-        ax.set_ylabel("Time (s)  \u2014  log scale")
+        ax.set_ylabel("Time (s)")
         ax.set_title(ds, fontsize=13)
         _strip_spines(ax)
 
@@ -263,7 +252,7 @@ def speedup_vs_naive(rows):
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
     v = "sequence-alignment"
-    speedups = [naive[ds]["min"] / sse[ds]["min"] for ds in datasets]
+    speedups = [naive[ds]["median"] / sse[ds]["median"] for ds in datasets]
     bars = ax.bar(
         x, speedups, width,
         label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
@@ -282,14 +271,14 @@ def speedup_vs_naive(rows):
     ax.axhline(y=1, color=PALETTE["naive"], linestyle="--", linewidth=1, alpha=0.5,
                label="Naive baseline (1x)")
     ax.legend(loc="upper left")
-    ax.set_title("SSE\u2192RVV Speedup over Naive (scalar)  \u2014  using min times")
+    ax.set_title("SSE\u2192RVV Speedup over Naive (scalar)  \u2014  using median times")
     _strip_spines(ax)
     fig.tight_layout()
     save(fig, "speedup_vs_naive.png")
 
 
 # ---------------------------------------------------------------------------
-# Speedup of widened variants over sequence-alignment (min times)
+# Speedup of widened variants over sequence-alignment (median times)
 # ---------------------------------------------------------------------------
 def speedup_widened_vs_sse(rows):
     sse = get_variant_data(rows, "sequence-alignment")
@@ -306,7 +295,7 @@ def speedup_widened_vs_sse(rows):
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
     for i, v in enumerate(variants):
-        speedups = [sse[ds]["min"] / vdata[v][ds]["min"] for ds in datasets]
+        speedups = [sse[ds]["median"] / vdata[v][ds]["median"] for ds in datasets]
         bars = ax.bar(
             x + i * width - width * (n - 1) / 2, speedups, width,
             label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
@@ -324,8 +313,8 @@ def speedup_widened_vs_sse(rows):
     ax.set_xlabel("Dataset")
     ax.axhline(y=1, color=PALETTE["sequence-alignment"], linestyle="--",
                linewidth=1, alpha=0.5, label="SSE\u2192RVV baseline (1x)")
-    ax.legend(loc="upper left")
-    ax.set_title("Speedup over SSE\u2192RVV (sse2rvv)  \u2014  using min times")
+    ax.legend(loc="lower right")
+    ax.set_title("Speedup over SSE\u2192RVV (sse2rvv)  \u2014  using median times")
     _strip_spines(ax)
     fig.tight_layout()
     save(fig, "speedup_widened_vs_sse.png")
