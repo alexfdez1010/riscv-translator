@@ -53,8 +53,8 @@ VARIANTS: dict[str, str] = {
 EXPERIMENT_PLAN: dict[str, list[str]] = {
     "naive": ["1k.fa", "10k.fa", "100k.fa"],
     "sequence-alignment": ["1k.fa", "10k.fa", "100k.fa", "1M.fa"],
-    "sequence-alignment-widened": ["10k.fa", "100k.fa", "1M.fa"],
-    "sequence-alignment-widened-auto": ["10k.fa", "100k.fa", "1M.fa"],
+    "sequence-alignment-widened": ["1k.fa","10k.fa", "100k.fa", "1M.fa"],
+    "sequence-alignment-widened-auto": ["1k.fa", "10k.fa", "100k.fa", "1M.fa"],
 }
 
 RISCV_COMPILE = (

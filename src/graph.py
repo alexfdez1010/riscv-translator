@@ -17,8 +17,6 @@ PALETTE = {
     "sequence-alignment-widened": "#5EBB73",  # jade green
     "sequence-alignment-widened-auto": "#F5A623",  # amber
 }
-PALETTE_DARK = {k: _darken(c, 0.25) if False else c for k, c in PALETTE.items()}
-
 VARIANT_LABELS = {
     "naive": "Naive (scalar)",
     "sequence-alignment": "SSE\u2192RVV (sse2rvv)",
@@ -146,130 +144,66 @@ def save(fig, name):
 
 
 # ---------------------------------------------------------------------------
-# Graph 1: Boxplot — all variants, per dataset
+# Boxplot — one subplot per dataset, own y-scale, log axis
 # ---------------------------------------------------------------------------
-def boxplot_all_variants(rows):
-    datasets = sorted({r["dataset"] for r in rows}, key=dataset_sort_key)
-    variants = list(VARIANT_LABELS.keys())
+def boxplot_combined(rows):
+    from matplotlib.patches import Patch
 
-    fig, axes = plt.subplots(1, len(datasets), figsize=(4.8 * len(datasets), 5.5),
+    variants = ["sequence-alignment", "sequence-alignment-widened",
+                "sequence-alignment-widened-auto"]
+    vdata = {v: get_variant_data(rows, v) for v in variants}
+    datasets = sorted(
+        set.union(*(set(vdata[v]) for v in variants)),
+        key=dataset_sort_key,
+    )
+
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), 6),
                              sharey=False)
     if len(datasets) == 1:
         axes = [axes]
 
     for ax, ds in zip(axes, datasets):
-        data, labels, colors = [], [], []
+        data, colors = [], []
         for v in variants:
-            vd = get_variant_data(rows, v)
-            if ds in vd:
-                data.append(vd[ds]["runs"])
-                labels.append(VARIANT_LABELS[v])
+            if ds in vdata[v]:
+                data.append(vdata[v][ds]["runs"])
                 colors.append(PALETTE[v])
 
-        _styled_boxplot(ax, data, colors)
-        ax.set_xticklabels(labels, rotation=28, ha="right", fontsize=9)
-        ax.set_ylabel("Time (s)")
-        ax.set_title(ds)
+        _styled_boxplot(ax, data, colors, width=0.55)
+
+        # Log scale with explicit, readable tick values
+        ax.set_yscale("log")
+        ax.yaxis.set_major_formatter(ticker.FuncFormatter(
+            lambda y, _: f"{y:g}"))
+        ax.yaxis.set_minor_formatter(ticker.FuncFormatter(
+            lambda y, _: f"{y:g}"))
+        ax.tick_params(axis="y", which="minor", labelsize=8, labelcolor="#7F8C8D")
+        ax.tick_params(axis="y", which="major", labelsize=10)
+        ax.grid(axis="y", which="minor", color=GRID_COLOR, linewidth=0.4, alpha=0.5)
+        ax.grid(axis="y", which="major", color=GRID_COLOR, linewidth=0.6, alpha=0.8)
+
+        # X-tick labels: short variant names
+        short_labels = []
+        for v in variants:
+            if ds in vdata[v]:
+                short_labels.append(VARIANT_LABELS[v])
+        ax.set_xticklabels(short_labels, rotation=30, ha="right", fontsize=8.5)
+        ax.set_ylabel("Time (s)  \u2014  log scale")
+        ax.set_title(ds, fontsize=13)
         _strip_spines(ax)
 
-    fig.suptitle("Run-time Distribution by Variant and Dataset",
-                 fontsize=15, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    save(fig, "boxplot_all_variants.png")
+    # Shared legend outside the subplots (centered below)
+    legend_handles = [Patch(facecolor=PALETTE[v], alpha=0.75, label=VARIANT_LABELS[v])
+                      for v in variants]
+    fig.legend(handles=legend_handles, loc="lower center",
+               ncol=len(variants), fontsize=10, frameon=True,
+               framealpha=0.95, edgecolor=GRID_COLOR,
+               bbox_to_anchor=(0.5, -0.02))
 
-
-# ---------------------------------------------------------------------------
-# Graph 2: Boxplot — naive vs sequence-alignment
-# ---------------------------------------------------------------------------
-def boxplot_naive_vs_sse(rows):
-    naive = get_variant_data(rows, "naive")
-    sse = get_variant_data(rows, "sequence-alignment")
-    common = sorted(set(naive) & set(sse), key=dataset_sort_key)
-
-    fig, axes = plt.subplots(1, len(common), figsize=(4.2 * len(common), 5))
-    if len(common) == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, common):
-        data = [naive[ds]["runs"], sse[ds]["runs"]]
-        labels = [VARIANT_LABELS["naive"], VARIANT_LABELS["sequence-alignment"]]
-        colors = [PALETTE["naive"], PALETTE["sequence-alignment"]]
-
-        _styled_boxplot(ax, data, colors)
-        speedup = naive[ds]["mean"] / sse[ds]["mean"]
-        ax.set_xticklabels(labels, fontsize=10)
-        ax.set_ylabel("Time (s)")
-        ax.set_title(f"{ds}  \u2014  {speedup:.1f}x speedup")
-        _strip_spines(ax)
-
-    fig.suptitle("Naive vs SSE\u2192RVV Translation",
-                 fontsize=15, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    save(fig, "boxplot_naive_vs_sse.png")
-
-
-# ---------------------------------------------------------------------------
-# Graph 3: Boxplot — sequence-alignment vs widened-auto
-# ---------------------------------------------------------------------------
-def boxplot_sse_vs_auto(rows):
-    sse = get_variant_data(rows, "sequence-alignment")
-    auto = get_variant_data(rows, "sequence-alignment-widened-auto")
-    common = sorted(set(sse) & set(auto), key=dataset_sort_key)
-
-    fig, axes = plt.subplots(1, len(common), figsize=(4.2 * len(common), 5))
-    if len(common) == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, common):
-        data = [sse[ds]["runs"], auto[ds]["runs"]]
-        labels = [VARIANT_LABELS["sequence-alignment"],
-                  VARIANT_LABELS["sequence-alignment-widened-auto"]]
-        colors = [PALETTE["sequence-alignment"],
-                  PALETTE["sequence-alignment-widened-auto"]]
-
-        _styled_boxplot(ax, data, colors)
-        speedup = sse[ds]["mean"] / auto[ds]["mean"]
-        ax.set_xticklabels(labels, rotation=12, ha="right", fontsize=9.5)
-        ax.set_ylabel("Time (s)")
-        ax.set_title(f"{ds}  \u2014  {speedup:.2f}x")
-        _strip_spines(ax)
-
-    fig.suptitle("SSE\u2192RVV (sse2rvv) vs Widened (auto)",
-                 fontsize=15, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    save(fig, "boxplot_sse_vs_auto.png")
-
-
-# ---------------------------------------------------------------------------
-# Graph 4: Boxplot — widened manual vs widened auto
-# ---------------------------------------------------------------------------
-def boxplot_widened_vs_auto(rows):
-    manual = get_variant_data(rows, "sequence-alignment-widened")
-    auto = get_variant_data(rows, "sequence-alignment-widened-auto")
-    common = sorted(set(manual) & set(auto), key=dataset_sort_key)
-
-    fig, axes = plt.subplots(1, len(common), figsize=(4.2 * len(common), 5))
-    if len(common) == 1:
-        axes = [axes]
-
-    for ax, ds in zip(axes, common):
-        data = [manual[ds]["runs"], auto[ds]["runs"]]
-        labels = [VARIANT_LABELS["sequence-alignment-widened"],
-                  VARIANT_LABELS["sequence-alignment-widened-auto"]]
-        colors = [PALETTE["sequence-alignment-widened"],
-                  PALETTE["sequence-alignment-widened-auto"]]
-
-        _styled_boxplot(ax, data, colors)
-        ratio = manual[ds]["mean"] / auto[ds]["mean"]
-        ax.set_xticklabels(labels, rotation=12, ha="right", fontsize=9.5)
-        ax.set_ylabel("Time (s)")
-        ax.set_title(f"{ds}  \u2014  ratio {ratio:.2f}x")
-        _strip_spines(ax)
-
-    fig.suptitle("Widened Manual vs Widened Auto",
-                 fontsize=15, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    save(fig, "boxplot_widened_vs_auto.png")
+    fig.suptitle("Run-time Distribution \u2014 Translated Variants by Dataset",
+                 fontsize=15, fontweight="bold", y=1.01)
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    save(fig, "boxplot_combined.png")
 
 
 # ---------------------------------------------------------------------------
@@ -321,31 +255,25 @@ def grouped_bar_translated(rows):
 # ---------------------------------------------------------------------------
 def speedup_vs_naive(rows):
     naive = get_variant_data(rows, "naive")
-    variants = ["sequence-alignment", "sequence-alignment-widened",
-                "sequence-alignment-widened-auto"]
-    vdata = {v: get_variant_data(rows, v) for v in variants}
-    datasets = sorted(
-        set(naive) & set.intersection(*(set(vdata[v]) for v in variants)),
-        key=dataset_sort_key,
-    )
+    sse = get_variant_data(rows, "sequence-alignment")
+    datasets = sorted(set(naive) & set(sse), key=dataset_sort_key)
 
     x = np.arange(len(datasets))
-    n = len(variants)
-    width = 0.25
+    width = 0.45
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
-    for i, v in enumerate(variants):
-        speedups = [naive[ds]["mean"] / vdata[v][ds]["mean"] for ds in datasets]
-        bars = ax.bar(
-            x + i * width - width * (n - 1) / 2, speedups, width,
-            label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
-            edgecolor="white", linewidth=0.6,
-        )
-        for bar, sp in zip(bars, speedups):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.3,
-                    f"{sp:.1f}x", ha="center", va="bottom",
-                    fontsize=9.5, fontweight="bold", color=TEXT_COLOR)
+    v = "sequence-alignment"
+    speedups = [naive[ds]["min"] / sse[ds]["min"] for ds in datasets]
+    bars = ax.bar(
+        x, speedups, width,
+        label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
+        edgecolor="white", linewidth=0.6,
+    )
+    for bar, sp in zip(bars, speedups):
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.2,
+                f"{sp:.1f}x", ha="center", va="bottom",
+                fontsize=10, fontweight="bold", color=TEXT_COLOR)
 
     ax.set_xticks(x)
     ax.set_xticklabels(datasets, fontsize=12)
@@ -354,14 +282,57 @@ def speedup_vs_naive(rows):
     ax.axhline(y=1, color=PALETTE["naive"], linestyle="--", linewidth=1, alpha=0.5,
                label="Naive baseline (1x)")
     ax.legend(loc="upper left")
-    ax.set_title("Speedup over Naive (scalar) Baseline")
+    ax.set_title("SSE\u2192RVV Speedup over Naive (scalar)  \u2014  using min times")
     _strip_spines(ax)
     fig.tight_layout()
     save(fig, "speedup_vs_naive.png")
 
 
 # ---------------------------------------------------------------------------
-# Graph 7: Line chart — scaling across datasets
+# Speedup of widened variants over sequence-alignment (min times)
+# ---------------------------------------------------------------------------
+def speedup_widened_vs_sse(rows):
+    sse = get_variant_data(rows, "sequence-alignment")
+    variants = ["sequence-alignment-widened", "sequence-alignment-widened-auto"]
+    vdata = {v: get_variant_data(rows, v) for v in variants}
+    datasets = sorted(
+        set(sse) & set.intersection(*(set(vdata[v]) for v in variants)),
+        key=dataset_sort_key,
+    )
+
+    x = np.arange(len(datasets))
+    n = len(variants)
+    width = 0.3
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    for i, v in enumerate(variants):
+        speedups = [sse[ds]["min"] / vdata[v][ds]["min"] for ds in datasets]
+        bars = ax.bar(
+            x + i * width - width * (n - 1) / 2, speedups, width,
+            label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
+            edgecolor="white", linewidth=0.6,
+        )
+        for bar, sp in zip(bars, speedups):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f"{sp:.2f}x", ha="center", va="bottom",
+                    fontsize=10, fontweight="bold", color=TEXT_COLOR)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets, fontsize=12)
+    ax.set_ylabel("Speedup (x)")
+    ax.set_xlabel("Dataset")
+    ax.axhline(y=1, color=PALETTE["sequence-alignment"], linestyle="--",
+               linewidth=1, alpha=0.5, label="SSE\u2192RVV baseline (1x)")
+    ax.legend(loc="upper left")
+    ax.set_title("Speedup over SSE\u2192RVV (sse2rvv)  \u2014  using min times")
+    _strip_spines(ax)
+    fig.tight_layout()
+    save(fig, "speedup_widened_vs_sse.png")
+
+
+# ---------------------------------------------------------------------------
+# Line chart — scaling across datasets
 # ---------------------------------------------------------------------------
 def scaling_line_chart(rows):
     variants = list(VARIANT_LABELS.keys())
@@ -443,12 +414,10 @@ def main():
     print(f"Loaded {len(rows)} benchmark rows from {BENCHMARKS_CSV}")
     print(f"Generating graphs in {GRAPHS_DIR}/\n")
 
-    boxplot_all_variants(rows)
-    boxplot_naive_vs_sse(rows)
-    boxplot_sse_vs_auto(rows)
-    boxplot_widened_vs_auto(rows)
+    boxplot_combined(rows)
     grouped_bar_translated(rows)
     speedup_vs_naive(rows)
+    speedup_widened_vs_sse(rows)
     scaling_line_chart(rows)
     stability_chart(rows)
 
