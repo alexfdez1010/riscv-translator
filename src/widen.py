@@ -25,7 +25,6 @@ from pathlib import Path
 from src.llm_types import LLM, Message
 from src.config import (
     DATASETS_DIR,
-    LLM_VALIDATION_RETRIES,
     PROJECT_DIR,
     REACT_MAX_STEPS,
     REFERENCE_FILE,
@@ -399,22 +398,33 @@ def build_widen_continue_prompt(
     code: str,
     build_command: str,
     pass_number: int,
+    validation_feedback: str | None = None,
 ) -> str:
     """Prompt for subsequent widening passes after one succeeded."""
+    error_section = ""
+    if validation_feedback:
+        error_section = f"""
+
+The previous pass produced errors.  Fix them AND continue widening
+remaining intrinsics in this pass:
+
+{validation_feedback}
+"""
+
     return f"""\
 Task: Continue widening {target_file} — this is pass {pass_number}.
 
-The code compiles and runs with the changes from previous passes.
 Examine the current code and identify remaining sse2rvv.h intrinsics or
 patterns that still use fixed 128-bit semantics.
-
+{error_section}
 If there are **NO** more SSE / sse2rvv.h intrinsics to widen (i.e. all
-SIMD code already uses native RVV), respond with ONLY:
+SIMD code already uses native RVV) and there are no compilation errors,
+respond with ONLY:
 
     ALL_WIDENED
 
-If there ARE remaining intrinsics to widen, produce search/replace blocks
-for the next batch.  Typical remaining work:
+If there ARE remaining intrinsics to widen or errors to fix, produce
+search/replace blocks for the next batch.  Typical remaining work:
 
 - ``qP_word()`` — rewrite with ``vlmax_e16()`` instead of hardcoded 8
 - ``sw_sse2_word()`` -> ``sw_rvv_word()`` — 16-bit native RVV path
@@ -650,7 +660,7 @@ class WidenAgent:
 
     # -- Single LLM request cycle with retries -------------------------------
 
-    def _generate_valid_file(
+    def _generate_single_pass(
         self,
         messages: list[dict[str, str]],
         snapshot: SourceSnapshot,
@@ -658,151 +668,87 @@ class WidenAgent:
         workspaces: WorkspaceSet,
         build_command: str,
     ) -> tuple[SourceSnapshot | None, ValidationResult]:
-        """Run one LLM request cycle with retries on diff/validation failure.
+        """Run a single LLM call, apply edits, and validate (no retries).
 
-        Returns ``(snapshot, validation)`` on success.
+        Returns ``(snapshot, validation)``.
         Detects the ``ALL_WIDENED`` signal and returns a special result.
         """
-        active_messages = list(messages)
-        current_snapshot = snapshot
-        latest_validation = ValidationResult(
-            ok=False,
-            stage="edit-failure",
-            returncode=None,
-            stdout="",
-            stderr="No validation attempted.",
+        # --- LLM request ---
+        try:
+            logger.info(
+                "LLM request with %d message(s)", len(messages),
+            )
+            response = self.llm(_to_messages(messages))
+        except Exception as exc:
+            return None, ValidationResult(
+                ok=False,
+                stage="internal-error",
+                returncode=None,
+                stdout="",
+                stderr=str(exc),
+            )
+
+        logger.info(
+            "LLM response (%d chars):\n%s",
+            len(response),
+            truncate_for_log(response, 3000),
         )
 
-        for attempt in range(LLM_VALIDATION_RETRIES + 1):
-            # --- LLM request ---
-            try:
-                logger.info(
-                    "LLM request attempt %d with %d message(s)",
-                    attempt + 1, len(active_messages),
-                )
-                response = self.llm(_to_messages(active_messages))
-            except Exception as exc:
-                latest_validation = ValidationResult(
-                    ok=False,
-                    stage="internal-error",
-                    returncode=None,
-                    stdout="",
-                    stderr=str(exc),
-                )
-                logger.warning(
-                    "LLM generation failed on attempt %d: %s",
-                    attempt + 1, exc,
-                )
-                return None, latest_validation
-
-            logger.info(
-                "LLM response (attempt %d, %d chars):\n%s",
-                attempt + 1, len(response),
-                truncate_for_log(response, 3000),
+        # --- Detect ALL_WIDENED signal ---
+        if "ALL_WIDENED" in response:
+            logger.info("LLM signalled ALL_WIDENED")
+            return None, ValidationResult(
+                ok=True,
+                stage="all-widened",
+                returncode=0,
+                stdout="All SSE intrinsics have been widened to native RVV.",
+                stderr="",
             )
 
-            # --- Detect ALL_WIDENED signal ---
-            if "ALL_WIDENED" in response:
-                logger.info("LLM signalled ALL_WIDENED")
-                return None, ValidationResult(
-                    ok=True,
-                    stage="all-widened",
-                    returncode=0,
-                    stdout="All SSE intrinsics have been widened to native RVV.",
-                    stderr="",
-                )
-
-            # --- Extract and apply search/replace blocks ---
-            candidate_snapshot = None
-            edit_error = None
-
-            sr_blocks = extract_search_replace(response)
-            if sr_blocks is not None:
-                logger.info(
-                    "Extracted %d search/replace block(s)", len(sr_blocks),
-                )
-                try:
-                    new_content = apply_search_replace(
-                        current_snapshot.files[file_name], sr_blocks,
-                    )
-                    candidate_snapshot = apply_content_to_snapshot(
-                        current_snapshot, file_name, new_content,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "Search/replace failed on attempt %d: %s",
-                        attempt + 1, exc,
-                    )
-                    edit_error = str(exc)
-
-            if candidate_snapshot is None:
-                error_msg = edit_error or (
-                    "Could not extract edits from the response. "
-                    "Use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks."
-                )
-                logger.warning(
-                    "No valid edits on attempt %d: %s",
-                    attempt + 1, error_msg,
-                )
-                if attempt >= LLM_VALIDATION_RETRIES:
-                    return None, latest_validation
-                active_messages = active_messages + [
-                    {"role": "assistant", "content": response},
-                    {
-                        "role": "user",
-                        "content": build_widen_edit_format_feedback(
-                            file_name,
-                            current_snapshot.files[file_name],
-                            error_msg,
-                        ),
-                    },
-                ]
-                continue
-
-            # --- Validate in Docker/QEMU ---
-            materialize_snapshot(workspaces.workspace_dir, candidate_snapshot)
-            latest_validation = self.docker_validator.validate(
-                workspaces.workspace_dir, build_command,
-            )
-            logger.info(
-                "Validation (attempt %d): ok=%s stage=%s rc=%s\n%s",
-                attempt + 1,
-                latest_validation.ok,
-                latest_validation.stage,
-                latest_validation.returncode,
-                truncate_for_log(latest_validation.combined_output, 2000),
+        # --- Extract and apply search/replace blocks ---
+        sr_blocks = extract_search_replace(response)
+        if sr_blocks is None:
+            logger.warning("No search/replace blocks found in response")
+            return None, ValidationResult(
+                ok=False,
+                stage="edit-failure",
+                returncode=None,
+                stdout="",
+                stderr="Could not extract edits from the response.",
             )
 
-            if latest_validation.ok:
-                if attempt > 0:
-                    logger.info(
-                        "Candidate fixed after %d retry(s)", attempt,
-                    )
-                return candidate_snapshot, latest_validation
+        logger.info("Extracted %d search/replace block(s)", len(sr_blocks))
+        try:
+            new_content = apply_search_replace(
+                snapshot.files[file_name], sr_blocks,
+            )
+            candidate_snapshot = apply_content_to_snapshot(
+                snapshot, file_name, new_content,
+            )
+        except ValueError as exc:
+            logger.warning("Search/replace failed: %s", exc)
+            return None, ValidationResult(
+                ok=False,
+                stage="edit-failure",
+                returncode=None,
+                stdout="",
+                stderr=str(exc),
+            )
 
-            if attempt >= LLM_VALIDATION_RETRIES:
-                logger.warning(
-                    "Validation failed after %d attempt(s); "
-                    "returning latest snapshot for next step",
-                    attempt + 1,
-                )
-                return candidate_snapshot, latest_validation
+        # --- Validate in Docker/QEMU ---
+        materialize_snapshot(workspaces.workspace_dir, candidate_snapshot)
+        validation = self.docker_validator.validate(
+            workspaces.workspace_dir, build_command,
+        )
+        logger.info(
+            "Validation: ok=%s stage=%s rc=%s\n%s",
+            validation.ok,
+            validation.stage,
+            validation.returncode,
+            truncate_for_log(validation.combined_output, 2000),
+        )
 
-            # Feed errors back for retry
-            active_messages = active_messages + [
-                {"role": "assistant", "content": response},
-                {
-                    "role": "user",
-                    "content": build_widen_repair_prompt(
-                        file_name,
-                        candidate_snapshot.files[file_name],
-                        latest_validation.as_feedback(),
-                    ),
-                },
-            ]
-            current_snapshot = candidate_snapshot
-
-        return None, latest_validation
+        return candidate_snapshot, validation
 
     # -- Main pipeline -------------------------------------------------------
 
@@ -876,17 +822,9 @@ class WidenAgent:
                 )
                 return 1
 
-            # --- Benchmark baseline on SSH hardware ---
-            baseline_time = self._benchmark_on_ssh(
-                workspaces.workspace_dir,
-                ssh_compile_command,
-                ssh_run_command,
-                "baseline (sse2rvv 128-bit)",
-            )
-
-            # --- Multi-pass widening loop ---
+            # --- Multi-pass widening loop (no per-pass retries) ---
             current_snapshot = snapshot
-            successful_passes = 0
+            last_error: str | None = None
 
             for step in range(1, max_steps + 1):
                 logger.info(
@@ -895,12 +833,13 @@ class WidenAgent:
                 )
                 current_code = current_snapshot.files[target_file]
 
-                # Build prompt
+                # Build prompt — include errors from previous pass
                 if step == 1:
                     user_content = build_widen_initial_prompt(
                         target_file,
                         current_code,
                         build_command,
+                        validation_feedback=last_error,
                     )
                 else:
                     user_content = build_widen_continue_prompt(
@@ -908,6 +847,7 @@ class WidenAgent:
                         current_code,
                         build_command,
                         pass_number=step,
+                        validation_feedback=last_error,
                     )
 
                 messages = [
@@ -918,7 +858,7 @@ class WidenAgent:
                     {"role": "user", "content": user_content},
                 ]
 
-                result, validation = self._generate_valid_file(
+                result, validation = self._generate_single_pass(
                     messages,
                     current_snapshot,
                     target_file,
@@ -928,9 +868,11 @@ class WidenAgent:
 
                 # ALL_WIDENED signal — done
                 if validation.ok and validation.stage == "all-widened":
-                    logger.info("All SSE intrinsics widened after %d pass(es)", step - 1)
-                    write_output(output_dir, current_snapshot)
-                    return 0
+                    logger.info(
+                        "All SSE intrinsics widened after %d pass(es)",
+                        step - 1,
+                    )
+                    break
 
                 # Internal error — abort
                 if result is None and validation.stage == "internal-error":
@@ -940,67 +882,79 @@ class WidenAgent:
                     )
                     return 1
 
-                # No valid edits produced
+                # No valid edits produced — carry error forward
                 if result is None:
                     logger.info(
-                        "Pass %d did not yield a valid candidate (%s), continuing",
+                        "Pass %d did not yield a valid candidate (%s), "
+                        "carrying error forward",
                         step, validation.stage,
                     )
+                    last_error = validation.stderr or validation.stdout
                     continue
 
-                # Validation failed — keep partial progress for next step
-                if not validation.ok:
-                    logger.info(
-                        "Pass %d made progress but validation still fails; continuing",
-                        step,
-                    )
-                    current_snapshot = result
-                    continue
-
-                # --- Validation passed ---
-                successful_passes += 1
+                # Accept the snapshot regardless of validation outcome
                 current_snapshot = result
 
-                # Benchmark this pass
-                pass_time = self._benchmark_on_ssh(
-                    workspaces.workspace_dir,
-                    ssh_compile_command,
-                    ssh_run_command,
-                    f"pass {step}",
-                )
-                if baseline_time and pass_time:
-                    speedup = baseline_time / pass_time
+                if validation.ok:
+                    logger.info("Pass %d compiled and ran OK", step)
+                    last_error = None
+                else:
                     logger.info(
-                        "Speedup after pass %d: %.2fx (%.2fs -> %.2fs)",
-                        step, speedup, baseline_time, pass_time,
+                        "Pass %d has errors — carrying forward to next pass",
+                        step,
                     )
+                    last_error = validation.as_feedback()
 
-                # Correctness check against Intel reference
-                correctness = self._validate_correctness(
-                    workspaces.workspace_dir,
-                )
-                if correctness is not None and not correctness.ok:
-                    logger.warning(
-                        "Pass %d passed compilation but failed correctness\n%s",
-                        step, correctness.combined_output,
-                    )
-                    # Will feed back in next iteration's repair prompt
+            # --- Write output ---
+            write_output(output_dir, current_snapshot)
+            logger.info("Wrote widened output to %s", output_dir)
 
-            # --- After all steps ---
-            if successful_passes > 0:
-                write_output(output_dir, current_snapshot)
-                logger.info(
-                    "Widening finished (%d successful pass(es)); "
-                    "wrote output to %s",
-                    successful_passes, output_dir,
-                )
-                return 0
-
-            logger.warning(
-                "Widening failed — no successful passes after %d step(s)",
-                max_steps,
+            # --- Final benchmark: baseline (original) vs widened ---
+            materialize_snapshot(workspaces.workspace_dir, snapshot)
+            baseline_time = self._benchmark_on_ssh(
+                workspaces.workspace_dir,
+                ssh_compile_command,
+                ssh_run_command,
+                "baseline (sse2rvv 128-bit)",
             )
-            return 1
+
+            materialize_snapshot(workspaces.workspace_dir, current_snapshot)
+            final_time = self._benchmark_on_ssh(
+                workspaces.workspace_dir,
+                ssh_compile_command,
+                ssh_run_command,
+                "final (widened RVV)",
+            )
+            if baseline_time and final_time:
+                speedup = baseline_time / final_time
+                logger.info(
+                    "Final speedup: %.2fx (%.2fs -> %.2fs)",
+                    speedup, baseline_time, final_time,
+                )
+
+            # --- Final correctness check against Intel reference ---
+            materialize_snapshot(workspaces.workspace_dir, current_snapshot)
+            correctness = self._validate_correctness(
+                workspaces.workspace_dir,
+            )
+            if correctness is None:
+                logger.warning(
+                    "Correctness check skipped (reference unavailable)"
+                )
+            elif correctness.ok:
+                logger.info(
+                    "FINAL CORRECTNESS CHECK PASSED — widened code matches "
+                    "Intel SSE reference"
+                )
+            else:
+                logger.warning(
+                    "FINAL CORRECTNESS CHECK FAILED — widened code differs "
+                    "from Intel SSE reference\n%s",
+                    correctness.combined_output,
+                )
+                return 1
+
+            return 0
 
         finally:
             logger.debug("Cleaning up workspace at %s", workspaces.root)

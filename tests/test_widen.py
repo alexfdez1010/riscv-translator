@@ -56,6 +56,7 @@ def _patch_infra(monkeypatch, tmp_path, *, docker_ok=True):
         ),
     )
     monkeypatch.setattr(widen.shutil, "rmtree", lambda *a, **kw: None)
+    monkeypatch.setattr(widen, "materialize_snapshot", lambda w, s: None)
     monkeypatch.setattr(
         DockerValidator,
         "validate",
@@ -197,11 +198,11 @@ def test_default_ssh_run_command():
 
 
 # ---------------------------------------------------------------------------
-# _generate_valid_file tests
+# _generate_single_pass tests
 # ---------------------------------------------------------------------------
 
 
-def test_generate_valid_file_applies_edits(monkeypatch, tmp_path):
+def test_generate_single_pass_applies_edits(monkeypatch, tmp_path):
     """Successful edit + Docker validation in one attempt."""
     monkeypatch.setattr(
         DockerValidator,
@@ -227,7 +228,7 @@ def test_generate_valid_file_applies_edits(monkeypatch, tmp_path):
     snapshot = _make_snapshot("void foo() {}\n")
     workspaces = widen.WorkspaceSet(tmp_path, tmp_path)
 
-    result, validation = agent._generate_valid_file(
+    result, validation = agent._generate_single_pass(
         [{"role": "user", "content": "start"}],
         snapshot,
         "ssw.c",
@@ -240,53 +241,7 @@ def test_generate_valid_file_applies_edits(monkeypatch, tmp_path):
     assert validation.ok is True
 
 
-def test_generate_valid_file_retries_on_compile_failure(monkeypatch, tmp_path):
-    """First attempt fails validation; second succeeds after feedback."""
-    responses = iter([
-        "First attempt.\n\n"
-        "<<<<<<< SEARCH\nseed\n=======\nbad code\n>>>>>>> REPLACE",
-        "Fix compile error.\n\n"
-        "<<<<<<< SEARCH\nbad code\n=======\ngood code\n>>>>>>> REPLACE",
-    ])
-    validations = iter([
-        ValidationResult(False, "compile", 1, "", "error: undeclared identifier"),
-        ValidationResult(True, "validation", 0, "ok", ""),
-    ])
-    calls = []
-
-    class FakeAgent(widen.WidenAgent):
-        def __init__(self):
-            super().__init__()
-            self.llm = lambda messages: calls.append(messages) or next(responses)
-
-    monkeypatch.setattr(widen, "LLM_VALIDATION_RETRIES", 2)
-    monkeypatch.setattr(
-        DockerValidator, "validate",
-        lambda self, workspace_dir, build_command: next(validations),
-    )
-    monkeypatch.setattr(widen, "materialize_snapshot", lambda w, s: None)
-
-    agent = FakeAgent()
-    snapshot = widen.SourceSnapshot(files={"ssw.c": "seed\n", "ssw.h": "h"})
-    workspaces = widen.WorkspaceSet(tmp_path, tmp_path)
-
-    result, validation = agent._generate_valid_file(
-        [{"role": "user", "content": "start"}],
-        snapshot,
-        "ssw.c",
-        workspaces,
-        "make all",
-    )
-
-    assert result is not None
-    assert result.files["ssw.c"] == "good code\n"
-    assert validation.ok is True
-    assert len(calls) == 2
-    # Second call should contain compile error feedback
-    assert "undeclared identifier" in calls[1][-1].content
-
-
-def test_generate_valid_file_detects_all_widened(monkeypatch, tmp_path):
+def test_generate_single_pass_detects_all_widened(monkeypatch, tmp_path):
     """LLM responds with ALL_WIDENED signal."""
     response = "ALL_WIDENED: No more SSE intrinsics to widen."
 
@@ -299,7 +254,7 @@ def test_generate_valid_file_detects_all_widened(monkeypatch, tmp_path):
     snapshot = _make_snapshot()
     workspaces = widen.WorkspaceSet(tmp_path, tmp_path)
 
-    result, validation = agent._generate_valid_file(
+    result, validation = agent._generate_single_pass(
         [{"role": "user", "content": "continue"}],
         snapshot,
         "ssw.c",
@@ -312,42 +267,28 @@ def test_generate_valid_file_detects_all_widened(monkeypatch, tmp_path):
     assert validation.stage == "all-widened"
 
 
-def test_generate_valid_file_retries_on_bad_edit_format(monkeypatch, tmp_path):
-    """LLM sends malformed response, then a valid one."""
-    responses = iter([
-        "Here is the fix:\n\nSome text without search/replace blocks.",
-        "Retry with proper format.\n\n"
-        "<<<<<<< SEARCH\nseed\n=======\nfixed\n>>>>>>> REPLACE",
-    ])
-    calls = []
+def test_generate_single_pass_returns_none_on_bad_edit_format(monkeypatch, tmp_path):
+    """LLM sends malformed response — returns None with edit-failure."""
 
     class FakeAgent(widen.WidenAgent):
         def __init__(self):
             super().__init__()
-            self.llm = lambda messages: calls.append(1) or next(responses)
-
-    monkeypatch.setattr(widen, "LLM_VALIDATION_RETRIES", 2)
-    monkeypatch.setattr(
-        DockerValidator, "validate",
-        lambda self, workspace_dir, build_command: ValidationResult(True, "validation", 0, "ok", ""),
-    )
-    monkeypatch.setattr(widen, "materialize_snapshot", lambda w, s: None)
+            self.llm = lambda messages: "Here is the fix:\n\nSome text without blocks."
 
     agent = FakeAgent()
     snapshot = widen.SourceSnapshot(files={"ssw.c": "seed\n", "ssw.h": "h"})
     workspaces = widen.WorkspaceSet(tmp_path, tmp_path)
 
-    result, validation = agent._generate_valid_file(
+    result, validation = agent._generate_single_pass(
         [{"role": "user", "content": "start"}],
         snapshot, "ssw.c", workspaces, "make all",
     )
 
-    assert result is not None
-    assert result.files["ssw.c"] == "fixed\n"
-    assert len(calls) == 2
+    assert result is None
+    assert validation.stage == "edit-failure"
 
 
-def test_generate_valid_file_returns_none_on_llm_exception(monkeypatch, tmp_path):
+def test_generate_single_pass_returns_none_on_llm_exception(monkeypatch, tmp_path):
     """LLM raises an exception — should return None with internal-error."""
 
     class FakeAgent(widen.WidenAgent):
@@ -359,7 +300,7 @@ def test_generate_valid_file_returns_none_on_llm_exception(monkeypatch, tmp_path
     snapshot = _make_snapshot()
     workspaces = widen.WorkspaceSet(tmp_path, tmp_path)
 
-    result, validation = agent._generate_valid_file(
+    result, validation = agent._generate_single_pass(
         [{"role": "user", "content": "start"}],
         snapshot, "ssw.c", workspaces, "make all",
     )
@@ -409,7 +350,7 @@ def test_run_writes_output_on_success(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             widen.SourceSnapshot(files={**snapshot.files, "ssw.c": "widened code"}),
             ValidationResult(True, "validation", 0, "ok", ""),
@@ -459,7 +400,7 @@ def test_run_stops_on_all_widened(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             None,
             ValidationResult(True, "all-widened", 0, "All done", ""),
@@ -488,7 +429,7 @@ def test_run_stops_early_on_internal_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             None,
             ValidationResult(False, "internal-error", None, "", "API key expired"),
@@ -531,7 +472,7 @@ def test_run_continues_past_edit_failure(monkeypatch, tmp_path):
             ValidationResult(True, "validation", 0, "ok", ""),
         )
 
-    monkeypatch.setattr(widen.WidenAgent, "_generate_valid_file", fake_generate)
+    monkeypatch.setattr(widen.WidenAgent, "_generate_single_pass", fake_generate)
 
     rc = widen.WidenAgent().run(
         source_dir=source_dir,
@@ -544,8 +485,8 @@ def test_run_continues_past_edit_failure(monkeypatch, tmp_path):
     assert call_count >= 2
 
 
-def test_run_returns_1_after_max_steps_no_progress(monkeypatch, tmp_path):
-    """All steps fail — returns 1 with no successful passes."""
+def test_run_writes_output_even_with_no_progress(monkeypatch, tmp_path):
+    """All steps fail edits — still writes output (correctness skipped)."""
     source_dir = tmp_path / "src"
     source_dir.mkdir()
     (source_dir / "ssw.c").write_text("stuck\n")
@@ -553,10 +494,14 @@ def test_run_returns_1_after_max_steps_no_progress(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
 
     _patch_infra(monkeypatch, tmp_path, docker_ok=True)
+    monkeypatch.setattr(
+        widen, "write_output",
+        lambda d, s: d.mkdir(parents=True, exist_ok=True),
+    )
 
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             None,
             ValidationResult(False, "edit-failure", None, "", "No edits"),
@@ -570,7 +515,8 @@ def test_run_returns_1_after_max_steps_no_progress(monkeypatch, tmp_path):
         max_steps=2,
     )
 
-    assert rc == 1
+    # Returns 0 because correctness check is skipped (no Intel reference)
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------
@@ -578,8 +524,8 @@ def test_run_returns_1_after_max_steps_no_progress(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_measures_speedup_at_each_step(monkeypatch, tmp_path):
-    """After each successful pass, _benchmark_on_ssh is called and speedup is computed."""
+def test_run_benchmarks_at_end(monkeypatch, tmp_path):
+    """After all passes, baseline and final benchmarks are run."""
     source_dir = tmp_path / "src"
     source_dir.mkdir()
     (source_dir / "ssw.c").write_text("seed\n")
@@ -596,7 +542,6 @@ def test_run_measures_speedup_at_each_step(monkeypatch, tmp_path):
 
     def fake_benchmark(self, workspace_dir, ssh_compile_cmd, ssh_run_cmd, label):
         bench_calls.append(label)
-        # Baseline returns 10s, widened returns 5s (2x speedup)
         if "baseline" in label:
             return 10.0
         return 5.0
@@ -604,7 +549,7 @@ def test_run_measures_speedup_at_each_step(monkeypatch, tmp_path):
     monkeypatch.setattr(widen.WidenAgent, "_benchmark_on_ssh", fake_benchmark)
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             widen.SourceSnapshot(files={**snapshot.files, "ssw.c": "widened"}),
             ValidationResult(True, "validation", 0, "ok", ""),
@@ -620,7 +565,7 @@ def test_run_measures_speedup_at_each_step(monkeypatch, tmp_path):
 
     assert len(bench_calls) == 2
     assert "baseline" in bench_calls[0]
-    assert "pass 1" in bench_calls[1]
+    assert "final" in bench_calls[1]
 
 
 def test_run_uses_original_source_for_intel_reference(monkeypatch, tmp_path):
@@ -647,7 +592,7 @@ def test_run_uses_original_source_for_intel_reference(monkeypatch, tmp_path):
     monkeypatch.setattr(widen.WidenAgent, "_get_intel_reference", fake_get_intel_ref)
     monkeypatch.setattr(
         widen.WidenAgent,
-        "_generate_valid_file",
+        "_generate_single_pass",
         lambda self, messages, snapshot, file_name, workspaces, build_command: (
             widen.SourceSnapshot(files={**snapshot.files, "ssw.c": "widened"}),
             ValidationResult(True, "validation", 0, "ok", ""),
