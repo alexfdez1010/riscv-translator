@@ -50,11 +50,34 @@ to use the hardware's full register width.
 ```
 src/               — Python package (translation agent, validators, LLM client)
 initial_code/      — Original SSW source files (SSE2, zlib removed) + sse2rvv.h subset
-translations/      — Successfully translated outputs (e.g., sequence-alignment/)
+translations/      — Successfully translated outputs (see below)
 datasets/          — FASTA test data for SSW benchmarking
 tests/             — Python test suite (pytest)
 docs/              — RVV reference material loaded as LLM context
 ```
+
+### Translations directory
+
+The `translations/` directory contains three variants of the SSW library
+translation, each representing a different stage of the pipeline:
+
+| Directory | Approach | Vector intrinsics | VLEN |
+|-----------|----------|-------------------|------|
+| `sequence-alignment/` | Phase 1 — automated via `src/repair.py` | `sse2rvv.h` (drop-in compatibility) | Fixed 128-bit |
+| `sequence-alignment-widened/` | Phase 2 — manually widened | Native `<riscv_vector.h>` | VLEN-agnostic |
+| `sequence-alignment-widened-auto/` | Phase 2 — automatically widened via `src/widen.py` | Native `<riscv_vector.h>` | VLEN-agnostic |
+
+- **`sequence-alignment/`**: The direct output of the Phase 1 repair pipeline.
+  Uses `sse2rvv.h` to map SSE intrinsics to RVV equivalents at a fixed 128-bit
+  width.  Includes the `sse2rvv.h` header in the output.
+- **`sequence-alignment-widened/`**: A manually crafted version that replaces
+  `sse2rvv.h` calls with native RVV intrinsics (`<riscv_vector.h>`), making the
+  code VLEN-agnostic so it can exploit the full width of the hardware's vector
+  registers.
+- **`sequence-alignment-widened-auto/`**: The output of the automated widening
+  pipeline (`src/widen.py`), which uses an LLM to transform the Phase 1
+  sse2rvv.h-based code into native RVV intrinsics.  Functionally equivalent to
+  the manual widening but produced automatically.
 
 ## Python environment
 
@@ -97,6 +120,7 @@ uv run python -m src.repair <source_dir> <target_file> <output_dir> \
 - **Search/replace**: `src/search_replace.py` — robust search/replace block parsing and application, tolerant of LLM formatting mistakes (trailing whitespace, markdown fences, fuzzy whitespace matching).
 - **Benchmark**: `src/benchmark.py` — runs original SSE code on Intel and translated RVV code on RISC-V, compares outputs.
 - **Check**: `src/check.py` — standalone validation tool for output directories.
+- **Widening pipeline**: `src/widen.py` — Phase 2 pipeline that transforms sse2rvv.h-based code to native RVV intrinsics (`<riscv_vector.h>`), making it VLEN-agnostic.  Uses a multi-pass LLM compile-fix loop with SSH benchmarking and correctness checking.
 - **Reference material**: `docs/riscv-reference/reference.md` is the authoritative RVV reference for LLM prompts.
 
 ## Testing
