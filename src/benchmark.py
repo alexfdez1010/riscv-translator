@@ -1,21 +1,24 @@
-"""Benchmark: run original SSE code on Intel and translated RVV code on RISC-V.
+"""Benchmark: run all paper experiments on RISC-V (ssh final), validate against SSE.
 
-When SSH_JUMP_HOST is set, the Intel reference runs on that remote host.
-When SSH_JUMP_HOST is unset (default), the Intel reference runs locally.
+Comparisons:
+  1. naive vs sequence-alignment — 1k, 10k, 100k
+  2. sequence-alignment vs sequence-alignment-widened-auto — 10k, 100k, 1M
+  3. sequence-alignment-widened vs sequence-alignment-widened-auto — 10k, 100k, 1M
 
-Validates that both produce identical alignment output, then compares execution time.
+Each (code_variant, dataset) pair is run 10 times.  Results are deduplicated
+and written to benchmarks.csv.  Correctness is validated against the original
+SSE code (initial_code) on Intel.
 
 Usage:
-    uv run python -m src.benchmark [--dataset FILE] [--original-dir DIR] [--translated-dir DIR]
+    uv run python -m src.benchmark
 """
 
-import argparse
+import csv
 import math
-import shutil
+import re
 import subprocess
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from src.config import (
@@ -30,83 +33,50 @@ from src.logger import configure_logging, get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_ORIGINAL_DIR = PROJECT_DIR / "initial_code"
-DEFAULT_TRANSLATED_DIR = PROJECT_DIR / "translations" / "sequence-alignment"
-DEFAULT_DATASET = "1M.fa"
 REFERENCE_FILE = "54mer_hap1_1.100.fa"
+DEFAULT_ORIGINAL_DIR = PROJECT_DIR / "initial_code"
+RUNS = 10
+CSV_PATH = PROJECT_DIR / "benchmarks.csv"
+
+# All RISC-V variants: label -> source dir (relative to PROJECT_DIR)
+VARIANTS: dict[str, str] = {
+    "naive": "naive/code",
+    "sequence-alignment": "translations/sequence-alignment",
+    "sequence-alignment-widened": "translations/sequence-alignment-widened",
+    "sequence-alignment-widened-auto": "translations/sequence-alignment-widened-auto",
+}
+
+# Deduplicated (variant, datasets) for all three comparison groups
+EXPERIMENT_PLAN: dict[str, list[str]] = {
+    "naive": ["1k.fa", "10k.fa", "100k.fa"],
+    "sequence-alignment": ["1k.fa", "10k.fa", "100k.fa", "1M.fa"],
+    "sequence-alignment-widened": ["10k.fa", "100k.fa", "1M.fa"],
+    "sequence-alignment-widened-auto": ["10k.fa", "100k.fa", "1M.fa"],
+}
+
+RISCV_COMPILE = (
+    f"{SSH_CC} -o ssw_test main.c ssw.c "
+    f"--target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
+)
+INTEL_COMPILE = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
 
 
-@dataclass(slots=True)
-class TimingStats:
-    """Statistics computed from multiple benchmark runs."""
-    times: list[float]
-
-    @property
-    def n(self) -> int:
-        return len(self.times)
-
-    @property
-    def mean(self) -> float:
-        return sum(self.times) / len(self.times) if self.times else 0.0
-
-    @property
-    def median(self) -> float:
-        if not self.times:
-            return 0.0
-        s = sorted(self.times)
-        mid = len(s) // 2
-        if len(s) % 2 == 0:
-            return (s[mid - 1] + s[mid]) / 2
-        return s[mid]
-
-    @property
-    def stdev(self) -> float:
-        if len(self.times) < 2:
-            return 0.0
-        m = self.mean
-        return math.sqrt(sum((t - m) ** 2 for t in self.times) / (len(self.times) - 1))
-
-    @property
-    def min(self) -> float:
-        return min(self.times) if self.times else 0.0
-
-    @property
-    def max(self) -> float:
-        return max(self.times) if self.times else 0.0
-
-    def summary(self) -> str:
-        if self.n == 1:
-            return f"{self.times[0]:.2f}s"
-        return (
-            f"mean={self.mean:.2f}s  median={self.median:.2f}s  "
-            f"stdev={self.stdev:.2f}s  min={self.min:.2f}s  max={self.max:.2f}s  "
-            f"(n={self.n})"
-        )
-
-
-@dataclass(slots=True)
-class BenchmarkResult:
-    host: str
-    label: str
-    ok: bool
-    elapsed_seconds: float
-    stdout: str
-    stderr: str
-    stats: TimingStats | None = None
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def check_ssh(host: str) -> bool:
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=5", host, "echo ok"],
             capture_output=True, timeout=10, text=True,
         )
-        return result.returncode == 0 and "ok" in result.stdout
+        return r.returncode == 0 and "ok" in r.stdout
     except Exception:
         return False
 
 
-def upload_to_host(host: str, remote_dir: str, local_paths: list[Path]) -> bool:
+def upload(host: str, remote_dir: str, local_paths: list[Path]) -> bool:
     subprocess.run(
         ["ssh", host, f"mkdir -p {remote_dir}/demo"],
         capture_output=True, timeout=30,
@@ -125,8 +95,7 @@ def upload_to_host(host: str, remote_dir: str, local_paths: list[Path]) -> bool:
     return True
 
 
-def upload_datasets(host: str, remote_dir: str, dataset_dir: Path, dataset: str) -> bool:
-    """Upload dataset files into remote demo/ subdirectory."""
+def upload_dataset(host: str, remote_dir: str, dataset_dir: Path, dataset: str) -> bool:
     for fname in [dataset, REFERENCE_FILE]:
         src = dataset_dir / fname
         if not src.exists():
@@ -140,6 +109,50 @@ def upload_datasets(host: str, remote_dir: str, dataset_dir: Path, dataset: str)
     return True
 
 
+def compile_on_host(host: str, remote_dir: str, compile_cmd: str, label: str) -> bool:
+    comp = subprocess.run(
+        ["ssh", host, f"cd {remote_dir} && {compile_cmd}"],
+        capture_output=True, timeout=120, text=True,
+    )
+    if comp.returncode != 0:
+        logger.error("[%s] Compilation failed:\n%s\n%s", label, comp.stdout, comp.stderr)
+        return False
+    return True
+
+
+def run_once(host: str, remote_dir: str, run_cmd: str) -> tuple[float, str, bool]:
+    """Run a command on host, return (elapsed, stdout, ok)."""
+    start = time.monotonic()
+    r = subprocess.run(
+        ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
+        capture_output=True, timeout=60 * 60 * 24, text=True,
+    )
+    elapsed = time.monotonic() - start
+    return elapsed, r.stdout, r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Shared types and functions used by other modules (check, repair, widen)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class BenchmarkResult:
+    host: str
+    label: str
+    ok: bool
+    elapsed_seconds: float
+    stdout: str
+    stderr: str
+
+
+def upload_to_host(host: str, remote_dir: str, local_paths: list[Path]) -> bool:
+    return upload(host, remote_dir, local_paths)
+
+
+def upload_datasets(host: str, remote_dir: str, dataset_dir: Path, dataset: str) -> bool:
+    return upload_dataset(host, remote_dir, dataset_dir, dataset)
+
+
 def run_on_host(
     host: str,
     remote_dir: str,
@@ -148,34 +161,10 @@ def run_on_host(
     label: str,
 ) -> BenchmarkResult:
     """Compile and run on a remote host, measuring execution time."""
-    # Compile
-    comp = subprocess.run(
-        ["ssh", host, f"cd {remote_dir} && {compile_cmd}"],
-        capture_output=True, timeout=120, text=True,
-    )
-    if comp.returncode != 0:
-        logger.error("[%s] Compilation failed:\n%s\n%s", label, comp.stdout, comp.stderr)
-        return BenchmarkResult(
-            host=host, label=label, ok=False, elapsed_seconds=0,
-            stdout=comp.stdout, stderr=comp.stderr,
-        )
-
-    # Run with timing
-    start = time.monotonic()
-    run = subprocess.run(
-        ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
-        capture_output=True, timeout=60 * 60 * 24, text=True,
-    )
-    elapsed = time.monotonic() - start
-
-    ok = run.returncode == 0
-    if not ok:
-        logger.error("[%s] Execution failed (rc=%d):\n%s\n%s", label, run.returncode, run.stdout, run.stderr)
-
-    return BenchmarkResult(
-        host=host, label=label, ok=ok, elapsed_seconds=elapsed,
-        stdout=run.stdout, stderr=run.stderr,
-    )
+    if not compile_on_host(host, remote_dir, compile_cmd, label):
+        return BenchmarkResult(host=host, label=label, ok=False, elapsed_seconds=0, stdout="", stderr="compile failed")
+    elapsed, stdout, ok = run_once(host, remote_dir, run_cmd)
+    return BenchmarkResult(host=host, label=label, ok=ok, elapsed_seconds=elapsed, stdout=stdout, stderr="" if ok else "run failed")
 
 
 def run_locally(
@@ -185,181 +174,34 @@ def run_locally(
     label: str,
 ) -> BenchmarkResult:
     """Compile and run locally, measuring execution time."""
-    # Compile
-    comp = subprocess.run(
-        compile_cmd, shell=True, cwd=work_dir,
-        capture_output=True, timeout=120, text=True,
-    )
+    comp = subprocess.run(compile_cmd, shell=True, cwd=work_dir, capture_output=True, timeout=120, text=True)
     if comp.returncode != 0:
-        logger.error("[%s] Compilation failed:\n%s\n%s", label, comp.stdout, comp.stderr)
-        return BenchmarkResult(
-            host="localhost", label=label, ok=False, elapsed_seconds=0,
-            stdout=comp.stdout, stderr=comp.stderr,
-        )
-
-    # Run with timing
+        return BenchmarkResult(host="localhost", label=label, ok=False, elapsed_seconds=0, stdout=comp.stdout, stderr=comp.stderr)
     start = time.monotonic()
-    run = subprocess.run(
-        run_cmd, shell=True, cwd=work_dir,
-        capture_output=True, timeout=600, text=True,
-    )
+    run = subprocess.run(run_cmd, shell=True, cwd=work_dir, capture_output=True, timeout=600, text=True)
     elapsed = time.monotonic() - start
-
-    ok = run.returncode == 0
-    if not ok:
-        logger.error("[%s] Execution failed (rc=%d):\n%s\n%s", label, run.returncode, run.stdout, run.stderr)
-
-    return BenchmarkResult(
-        host="localhost", label=label, ok=ok, elapsed_seconds=elapsed,
-        stdout=run.stdout, stderr=run.stderr,
-    )
+    return BenchmarkResult(host="localhost", label=label, ok=run.returncode == 0, elapsed_seconds=elapsed, stdout=run.stdout, stderr=run.stderr)
 
 
-def rerun_on_host(
-    host: str,
-    remote_dir: str,
-    run_cmd: str,
-    label: str,
-) -> float:
-    """Re-run an already-compiled binary on a remote host, return elapsed time."""
-    start = time.monotonic()
-    run = subprocess.run(
-        ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
-        capture_output=True, timeout=60 * 60 * 24, text=True,
-    )
-    elapsed = time.monotonic() - start
-    if run.returncode != 0:
-        logger.warning("[%s] Re-run failed (rc=%d), skipping this iteration", label, run.returncode)
-        return -1.0
-    return elapsed
-
-
-def rerun_locally(
-    work_dir: Path,
-    run_cmd: str,
-    label: str,
-) -> float:
-    """Re-run an already-compiled binary locally, return elapsed time."""
-    start = time.monotonic()
-    run = subprocess.run(
-        run_cmd, shell=True, cwd=work_dir,
-        capture_output=True, timeout=600, text=True,
-    )
-    elapsed = time.monotonic() - start
-    if run.returncode != 0:
-        logger.warning("[%s] Re-run failed (rc=%d), skipping this iteration", label, run.returncode)
-        return -1.0
-    return elapsed
-
-
-def prepare_local_dir(
-    original_dir: Path,
-    dataset_dir: Path,
-    dataset: str,
-) -> Path:
+def prepare_local_dir(original_dir: Path, dataset_dir: Path, dataset: str) -> Path:
     """Copy original source and dataset files into a temporary directory."""
+    import shutil
+    import tempfile
     tmp = Path(tempfile.mkdtemp(prefix="bench-intel-"))
-    # Copy source files
     for p in original_dir.iterdir():
         if p.is_file():
             shutil.copy2(p, tmp / p.name)
-    # Create demo/ subdirectory with datasets
     demo = tmp / "demo"
     demo.mkdir()
     for fname in [dataset, REFERENCE_FILE]:
         src = dataset_dir / fname
         if src.exists():
             shutil.copy2(src, demo / fname)
-        else:
-            logger.error("Dataset file not found: %s", src)
     return tmp
 
 
 def normalize_output(raw: str) -> str:
-    """Normalize alignment output for comparison.
-
-    Strips trailing whitespace, removes empty lines, and removes CPU time
-    measurements (which naturally differ between platforms).
-
-    CPU time messages from stderr can interleave mid-line when ``2>&1`` is
-    used (e.g. ``"optimal_alignmCPU time: 1.23 seconds\\nent_score: …"``),
-    so we strip them from the raw string *before* splitting into lines and
-    then rejoin any line that was split by the removal.
-    """
-    import re
-    # Strip CPU time stamps that may appear anywhere (including mid-line).
-    # The newline that the CPU time fprintf adds is consumed by \s* so the
-    # two halves of the interrupted line get glued back together.
-    cleaned = re.sub(r'CPU time:\s*[\d.]+\s*seconds\s*\n?', '', raw)
-    lines = [line.rstrip() for line in cleaned.strip().splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def _parse_alignment_records(text: str) -> list[dict[str, str]]:
-    """Parse SSW alignment output into a list of records.
-
-    Each record is a dict of field name → value extracted from the tab-separated
-    score line.  The ``target_name`` and ``query_name`` lines that precede it are
-    included as fields too.
-
-    Recognised fields (all optional except optimal_alignment_score):
-        target_name, query_name, optimal_alignment_score,
-        suboptimal_alignment_score, strand, target_begin, target_end,
-        query_begin, query_end.
-    """
-    import re
-
-    norm = normalize_output(text)
-    records: list[dict[str, str]] = []
-    current: dict[str, str] = {}
-
-    for line in norm.splitlines():
-        # "target_name: <value>" starts a new record
-        m = re.match(r"target_name:\s*(.+)", line)
-        if m:
-            if current:
-                records.append(current)
-            current = {"target_name": m.group(1).strip()}
-            continue
-
-        m = re.match(r"query_name:\s*(.+)", line)
-        if m:
-            current["query_name"] = m.group(1).strip()
-            continue
-
-        # Tab-separated key: value pairs on the score line
-        if "optimal_alignment_score:" in line:
-            for part in re.split(r"\t+", line):
-                kv = re.match(r"(\S+):\s*(.+)", part.strip())
-                if kv:
-                    current[kv.group(1)] = kv.group(2).strip()
-
-    if current:
-        records.append(current)
-
-    return records
-
-
-# Fields that must match for correctness.
-_REQUIRED_FIELDS = [
-    "target_name",
-    "query_name",
-    "optimal_alignment_score",
-    "strand",
-    "target_end",
-    "query_end",
-]
-
-# Fields compared only when strict_suboptimal is True.
-_OPTIONAL_FIELDS = [
-    "suboptimal_alignment_score",
-]
-
-# Fields that are compared when present in both records but not required.
-_EXTRA_FIELDS = [
-    "target_begin",
-    "query_begin",
-]
+    return _normalize(raw)
 
 
 def compare_outputs(
@@ -368,388 +210,263 @@ def compare_outputs(
     *,
     strict_suboptimal: bool = False,
 ) -> tuple[bool, str]:
-    """Compare alignment outputs from both runs.
+    """Compare alignment outputs from both runs."""
+    match, details = validate_output(reference.stdout, other.stdout)
+    return match, details
 
-    Parses each output into structured alignment records and compares the key
-    fields (optimal score, strand, target/query end positions).
 
-    When *strict_suboptimal* is ``True`` the ``suboptimal_alignment_score`` field
-    is also compared; otherwise it is ignored (it is implementation-dependent).
+# ---------------------------------------------------------------------------
+# Statistics
+# ---------------------------------------------------------------------------
 
-    Returns ``(match, details)``.
-    """
-    ref_label = reference.label
-    other_label = other.label
-    ref_recs = _parse_alignment_records(reference.stdout)
-    other_recs = _parse_alignment_records(other.stdout)
+def _percentile(sorted_data: list[float], p: float) -> float:
+    n = len(sorted_data)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return sorted_data[0]
+    idx = (p / 100.0) * (n - 1)
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    frac = idx - lo
+    return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
 
-    if len(ref_recs) != len(other_recs):
-        return False, (
-            f"Record count mismatch: {ref_label}={len(ref_recs)}, {other_label}={len(other_recs)}"
-        )
 
-    fields_to_check = list(_REQUIRED_FIELDS)
-    if strict_suboptimal:
-        fields_to_check += _OPTIONAL_FIELDS
-    fields_to_check += _EXTRA_FIELDS
+def _stats_row(times: list[float], max_runs: int) -> dict:
+    s = sorted(times)
+    n = len(times)
+    mean = sum(times) / n if n else 0.0
+    mid = n // 2
+    median = ((s[mid - 1] + s[mid]) / 2 if n % 2 == 0 else s[mid]) if n else 0.0
+    stdev = (math.sqrt(sum((t - mean) ** 2 for t in times) / (n - 1)) if n > 1 else 0.0)
+    q1 = _percentile(s, 25)
+    q3 = _percentile(s, 75)
+    return {
+        "n_runs": n,
+        "mean": mean,
+        "median": median,
+        "min": min(times) if times else 0.0,
+        "max": max(times) if times else 0.0,
+        "stdev": stdev,
+        "q1": q1,
+        "q3": q3,
+        "iqr": q3 - q1,
+        "times": times,
+    }
 
-    mismatches: list[str] = []
-    for idx, (a, b) in enumerate(zip(ref_recs, other_recs)):
-        for field in fields_to_check:
-            va = a.get(field)
-            vb = b.get(field)
-            # Skip fields missing from both sides.
+
+# ---------------------------------------------------------------------------
+# Output comparison (SSE validation)
+# ---------------------------------------------------------------------------
+
+def _normalize(raw: str) -> str:
+    cleaned = re.sub(r'CPU time:\s*[\d.]+\s*seconds\s*\n?', '', raw)
+    lines = [line.rstrip() for line in cleaned.strip().splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _parse_records(text: str) -> list[dict[str, str]]:
+    norm = _normalize(text)
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in norm.splitlines():
+        m = re.match(r"target_name:\s*(.+)", line)
+        if m:
+            if current:
+                records.append(current)
+            current = {"target_name": m.group(1).strip()}
+            continue
+        m = re.match(r"query_name:\s*(.+)", line)
+        if m:
+            current["query_name"] = m.group(1).strip()
+            continue
+        if "optimal_alignment_score:" in line:
+            for part in re.split(r"\t+", line):
+                kv = re.match(r"(\S+):\s*(.+)", part.strip())
+                if kv:
+                    current[kv.group(1)] = kv.group(2).strip()
+    if current:
+        records.append(current)
+    return records
+
+
+_CHECK_FIELDS = [
+    "target_name", "query_name", "optimal_alignment_score",
+    "strand", "target_end", "query_end",
+]
+
+
+def validate_output(ref_stdout: str, test_stdout: str) -> tuple[bool, str]:
+    ref = _parse_records(ref_stdout)
+    test = _parse_records(test_stdout)
+    if len(ref) != len(test):
+        return False, f"record count mismatch: {len(ref)} vs {len(test)}"
+    mismatches = []
+    for i, (a, b) in enumerate(zip(ref, test)):
+        for f in _CHECK_FIELDS:
+            va, vb = a.get(f), b.get(f)
             if va is None and vb is None:
                 continue
-            # For extra (non-required) fields, skip if either side is missing.
-            if field in _EXTRA_FIELDS and (va is None or vb is None):
-                continue
             if va != vb:
-                query = a.get("query_name", f"record #{idx+1}")
-                mismatches.append(
-                    f"  record {idx+1} ({query}): "
-                    f"{field} {ref_label}={va!r} {other_label}={vb!r}"
-                )
-
+                mismatches.append(f"rec {i+1} {f}: {va!r} vs {vb!r}")
     if not mismatches:
-        ignored = "" if strict_suboptimal else " (suboptimal_alignment_score ignored)"
-        return True, f"Outputs match: {len(ref_recs)} alignment records compared.{ignored}"
-
-    details = [
-        f"Alignment records compared: {len(ref_recs)}",
-        f"Mismatched fields: {len(mismatches)}",
-        "First differences:",
-    ]
-    details.extend(mismatches[:10])
-    if len(mismatches) > 10:
-        details.append(f"  ... and {len(mismatches) - 10} more")
-
-    return False, "\n".join(details)
+        return True, f"{len(ref)} records match"
+    return False, "; ".join(mismatches[:5])
 
 
-def _run_riscv_entry(
-    label: str,
-    source_dir: Path,
-    final_host: str,
-    remote_dir: str,
-    dataset_dir: Path,
-    dataset: str,
-    run_cmd_suffix: str,
-) -> BenchmarkResult | None:
-    """Upload, compile and run one RISC-V implementation."""
-    src_files = [p for p in source_dir.iterdir() if p.is_file()]
-    src_dirs = [p for p in source_dir.iterdir() if p.is_dir()]
-    logger.info("Uploading %s to %s:%s ...", label, final_host, remote_dir)
-    if not upload_to_host(final_host, remote_dir, src_files + src_dirs):
-        return None
-    if not upload_datasets(final_host, remote_dir, dataset_dir, dataset):
-        return None
+# ---------------------------------------------------------------------------
+# CSV writing
+# ---------------------------------------------------------------------------
 
-    logger.info("Running %s on RISC-V (%s) ...", label, final_host)
-    compile_cmd = f"{SSH_CC} -o ssw_test main.c ssw.c --target=riscv64-linux-gnu -march=rv64imafdcv -O2 -I. -lm 2>&1"
-    return run_on_host(final_host, remote_dir, compile_cmd, run_cmd_suffix, label)
-
-
-def benchmark(
-    dataset: str = DEFAULT_DATASET,
-    original_dir: Path = DEFAULT_ORIGINAL_DIR,
-    translated_dir: Path = DEFAULT_TRANSLATED_DIR,
-    dataset_dir: Path = DATASETS_DIR,
-    strict_suboptimal: bool = False,
-    rivals: list[tuple[str, Path]] | None = None,
-    runs: int = 1,
-) -> int:
-    """Run benchmark comparing implementations.
-
-    *rivals* is an optional list of ``(label, path)`` pairs for additional
-    RISC-V implementations to include in the comparison.
-
-    *runs* controls how many times each implementation is executed.  When > 1,
-    the first run is used for correctness validation and all runs contribute
-    to timing statistics (mean, median, stdev, min, max).
-    """
-    run_intel_locally = not SSH_JUMP_HOST
-    jump_host = SSH_JUMP_HOST
-    final_host = SSH_HOST
-    final_remote = f"{REMOTE_DIR}-bench-translated"
-
-    logger.info("Benchmark dataset: %s", dataset)
-    if run_intel_locally:
-        logger.info("Original code: %s -> localhost (Intel, local)", original_dir)
-    else:
-        logger.info("Original code: %s -> %s (Intel, SSH)", original_dir, jump_host)
-    logger.info("Translated code: %s -> %s (RISC-V)", translated_dir, final_host)
-    for label, path in (rivals or []):
-        logger.info("Rival %s: %s -> %s (RISC-V)", label, path, final_host)
-
-    # Check connectivity for remote hosts
-    if not run_intel_locally:
-        if not check_ssh(jump_host):
-            logger.error("Cannot reach jump host: %s", jump_host)
-            return 1
-        logger.info("SSH to %s: OK", jump_host)
-
-    if not check_ssh(final_host):
-        logger.error("Cannot reach final host: %s", final_host)
-        return 1
-    logger.info("SSH to %s: OK", final_host)
-
-    run_cmd_suffix = f"./ssw_test demo/{dataset} demo/{REFERENCE_FILE} 2>&1"
-
-    # --- Intel (original SSE) ---
-    intel_compile = "gcc -O2 -o ssw_test main.c ssw.c -lm 2>&1"
-
-    if run_intel_locally:
-        logger.info("Running original code locally (Intel) ...")
-        local_dir = prepare_local_dir(original_dir, dataset_dir, dataset)
-        try:
-            intel_result = run_locally(
-                local_dir, intel_compile, run_cmd_suffix, "Intel (original SSE)",
-            )
-        finally:
-            shutil.rmtree(local_dir, ignore_errors=True)
-    else:
-        jump_remote = f"{REMOTE_DIR}-bench-original"
-        original_files = [p for p in original_dir.iterdir() if p.is_file()]
-        logger.info("Uploading original code to %s:%s ...", jump_host, jump_remote)
-        if not upload_to_host(jump_host, jump_remote, original_files):
-            return 1
-        if not upload_datasets(jump_host, jump_remote, dataset_dir, dataset):
-            return 1
-        logger.info("Running original code on Intel (%s) ...", jump_host)
-        intel_result = run_on_host(
-            jump_host, jump_remote, intel_compile, run_cmd_suffix, "Intel (original SSE)",
-        )
-
-    # --- RISC-V (translated RVV) ---
-    riscv_result = _run_riscv_entry(
-        "RISC-V (translated RVV)", translated_dir, final_host,
-        final_remote, dataset_dir, dataset, run_cmd_suffix,
+def write_csv(
+    results: dict[tuple[str, str], dict],
+    csv_path: Path,
+    max_runs: int,
+) -> None:
+    run_cols = [f"run_{i + 1}" for i in range(max_runs)]
+    header = (
+        ["code_variant", "dataset", "n_runs"]
+        + run_cols
+        + ["mean", "median", "min", "max", "stdev", "q1", "q3", "iqr", "correct"]
     )
-    if riscv_result is None:
-        return 1
+    rows: list[list[str]] = []
+    for (variant, ds), data in sorted(results.items()):
+        st = data["stats"]
+        row: list[str] = [variant, ds, str(st["n_runs"])]
+        for i in range(max_runs):
+            row.append(f"{st['times'][i]:.6f}" if i < st["n_runs"] else "")
+        for k in ["mean", "median", "min", "max", "stdev", "q1", "q3", "iqr"]:
+            row.append(f"{st[k]:.6f}")
+        row.append(str(data.get("correct", "")))
+        rows.append(row)
 
-    # --- RISC-V (rivals) ---
-    rival_results: list[BenchmarkResult] = []
-    for idx, (label, path) in enumerate(rivals or []):
-        rival_remote = f"{REMOTE_DIR}-bench-rival-{idx}"
-        result = _run_riscv_entry(
-            label, path, final_host,
-            rival_remote, dataset_dir, dataset, run_cmd_suffix,
-        )
-        if result is None:
-            return 1
-        rival_results.append(result)
-
-    # Collect all results
-    all_results = [intel_result]
-    all_results.append(riscv_result)
-    all_results.extend(rival_results)
-
-    # Check for failures before doing extra runs
-    failed = [r for r in all_results if not r.ok]
-    if failed:
-        print("\nOne or more executions failed.")
-        for r in failed:
-            print(f"\n[{r.label} stderr]\n{r.stderr}")
-        return 1
-
-    # --- Repeated runs for timing statistics ---
-    # Build a mapping from each result to its rerun context so we can
-    # re-execute without recompiling.
-    @dataclass
-    class _RerunCtx:
-        host: str | None        # None = local
-        remote_dir: str | None  # None = local
-        local_dir: Path | None  # None = remote
-
-    rerun_map: dict[str, _RerunCtx] = {}
-
-    # Intel
-    if run_intel_locally:
-        # For local reruns we need the temp dir to still exist.  We recreate
-        # it if runs > 1 (the original was cleaned up).
-        rerun_map[intel_result.label] = _RerunCtx(
-            host=None, remote_dir=None,
-            local_dir=prepare_local_dir(original_dir, dataset_dir, dataset) if runs > 1 else None,
-        )
-    else:
-        rerun_map[intel_result.label] = _RerunCtx(
-            host=jump_host, remote_dir=f"{REMOTE_DIR}-bench-original", local_dir=None,
-        )
-
-    # Translated
-    rerun_map[riscv_result.label] = _RerunCtx(
-        host=final_host, remote_dir=final_remote, local_dir=None,
-    )
-
-    # Rivals
-    for idx, result in enumerate(rival_results):
-        rerun_map[result.label] = _RerunCtx(
-            host=final_host, remote_dir=f"{REMOTE_DIR}-bench-rival-{idx}", local_dir=None,
-        )
-
-    # Initialize stats with the first run's time
-    for r in all_results:
-        r.stats = TimingStats(times=[r.elapsed_seconds])
-
-    # Additional runs (2..N)
-    if runs > 1:
-        logger.info("Running %d additional iterations for timing statistics ...", runs - 1)
-        for iteration in range(2, runs + 1):
-            logger.info("--- Iteration %d/%d ---", iteration, runs)
-            for r in all_results:
-                ctx = rerun_map[r.label]
-                if ctx.host is not None:
-                    t = rerun_on_host(ctx.host, ctx.remote_dir, run_cmd_suffix, r.label)
-                else:
-                    t = rerun_locally(ctx.local_dir, run_cmd_suffix, r.label)
-                if t >= 0:
-                    r.stats.times.append(t)
-                    logger.info("  %s: %.2fs", r.label, t)
-
-        # Clean up local temp dirs
-        for ctx in rerun_map.values():
-            if ctx.local_dir is not None:
-                shutil.rmtree(ctx.local_dir, ignore_errors=True)
-
-        # Update elapsed_seconds to median for ratio calculations
-        for r in all_results:
-            r.elapsed_seconds = r.stats.median
-
-    # --- Report ---
-    print("\n" + "=" * 60)
-    print("BENCHMARK RESULTS")
-    print("=" * 60)
-    print(f"Dataset: {dataset}")
-    if runs > 1:
-        print(f"Runs: {runs}")
-    print("-" * 60)
-
-    if runs == 1:
-        for r in all_results:
-            status = "PASS" if r.ok else "FAIL"
-            print(f"  {r.label:30s}  {status:5s}  {r.elapsed_seconds:8.2f}s  ({r.host})")
-    else:
-        for r in all_results:
-            status = "PASS" if r.ok else "FAIL"
-            print(f"  {r.label:30s}  {status:5s}  {r.stats.summary()}")
-
-    print("-" * 60)
-
-    # Compare outputs for correctness (all vs Intel reference, from first run)
-    all_match = True
-    for r in all_results[1:]:
-        match, details = compare_outputs(
-            intel_result, r, strict_suboptimal=strict_suboptimal,
-        )
-        label = r.label
-        print(f"\nOutput comparison (Intel vs {label}): {'MATCH' if match else 'MISMATCH'}")
-        print(details)
-        if not match:
-            all_match = False
-
-    # Timing comparison vs Intel (uses median when runs > 1)
-    ref_time = intel_result.elapsed_seconds
-    if ref_time > 0:
-        for r in all_results[1:]:
-            ratio = r.elapsed_seconds / ref_time
-            time_label = "median" if runs > 1 else "time"
-            print(f"\n{r.label} / Intel {time_label} ratio: {ratio:.2f}x")
-
-    # Cross-comparison between RISC-V implementations
-    riscv_entries = [r for r in all_results[1:] if r.ok]
-    if len(riscv_entries) >= 2:
-        ref = riscv_entries[0]
-        time_label = "median" if runs > 1 else "time"
-        print(f"\n--- RISC-V cross-comparison (reference: {ref.label}, {time_label}) ---")
-        for r in riscv_entries[1:]:
-            if ref.elapsed_seconds > 0:
-                ratio = r.elapsed_seconds / ref.elapsed_seconds
-                print(f"  {r.label:30s}  {ratio:.3f}x  ({r.elapsed_seconds:.2f}s vs {ref.elapsed_seconds:.2f}s)")
-
-    if all_match:
-        print("\nBenchmark PASSED: all implementations produce identical output.")
-    else:
-        print("\nBenchmark FINISHED: some outputs differ (see above).")
-    return 0
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
 
 
-def _parse_rival(value: str) -> tuple[str, Path]:
-    """Parse a ``LABEL:PATH`` rival specification."""
-    if ":" in value:
-        label, path_str = value.split(":", 1)
-        return label.strip(), Path(path_str.strip())
-    # No label — derive from directory name
-    p = Path(value)
-    return f"RISC-V ({p.name})", p
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Benchmark original SSE code on Intel vs translated RVV code on RISC-V"
-    )
-    parser.add_argument(
-        "--dataset",
-        default=DEFAULT_DATASET,
-        help=f"Dataset file name to use (default: {DEFAULT_DATASET})",
-    )
-    parser.add_argument(
-        "--original-dir",
-        type=Path,
-        default=DEFAULT_ORIGINAL_DIR,
-        help="Directory with original SSE source code",
-    )
-    parser.add_argument(
-        "--translated-dir",
-        type=Path,
-        default=DEFAULT_TRANSLATED_DIR,
-        help="Directory with translated RVV source code",
-    )
-    parser.add_argument(
-        "--rival",
-        action="append",
-        default=[],
-        metavar="LABEL:PATH",
-        help="Additional RISC-V implementation to compare (repeatable). "
-             "Format: 'My Label:path/to/dir' or just 'path/to/dir'",
-    )
-    parser.add_argument(
-        "--dataset-dir",
-        type=Path,
-        default=DATASETS_DIR,
-        help="Directory containing dataset files",
-    )
-    parser.add_argument(
-        "--strict-suboptimal",
-        action="store_true",
-        default=False,
-        help="Also compare suboptimal_alignment_score (implementation-dependent)",
-    )
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Run each implementation N times and report timing statistics "
-             "(mean, median, stdev, min, max). Default: 1",
-    )
-    return parser.parse_args()
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     configure_logging(level="INFO")
-    args = parse_args()
-    rivals = [_parse_rival(r) for r in args.rival]
-    return benchmark(
-        dataset=args.dataset,
-        original_dir=args.original_dir,
-        translated_dir=args.translated_dir,
-        dataset_dir=args.dataset_dir,
-        strict_suboptimal=args.strict_suboptimal,
-        rivals=rivals,
-        runs=args.runs,
-    )
+
+    final_host = SSH_HOST
+    jump_host = SSH_JUMP_HOST
+
+    # --- Connectivity ---
+    if not check_ssh(final_host):
+        logger.error("Cannot reach RISC-V host: %s", final_host)
+        return 1
+    logger.info("SSH to %s (RISC-V): OK", final_host)
+
+    has_intel = bool(jump_host) and check_ssh(jump_host)
+    if has_intel:
+        logger.info("SSH to %s (Intel): OK", jump_host)
+    else:
+        logger.warning("No Intel host — skipping SSE validation")
+
+    # --- Phase 1: RISC-V benchmarks ---
+    results: dict[tuple[str, str], dict] = {}
+    all_datasets: set[str] = set()
+
+    for variant, datasets in EXPERIMENT_PLAN.items():
+        source_dir = PROJECT_DIR / VARIANTS[variant]
+        remote_dir = f"{REMOTE_DIR}-paper-{variant}"
+
+        # Upload source
+        src_items = list(source_dir.iterdir())
+        logger.info("Uploading %s ...", variant)
+        if not upload(final_host, remote_dir, src_items):
+            return 1
+
+        # Compile once
+        if not compile_on_host(final_host, remote_dir, RISCV_COMPILE, variant):
+            return 1
+        logger.info("Compiled %s OK", variant)
+
+        # Run each dataset
+        for ds in datasets:
+            all_datasets.add(ds)
+            if not upload_dataset(final_host, remote_dir, DATASETS_DIR, ds):
+                return 1
+
+            run_cmd = f"./ssw_test demo/{ds} demo/{REFERENCE_FILE} 2>&1"
+            label = f"{variant} | {ds}"
+            logger.info("Benchmarking %s (%d runs) ...", label, RUNS)
+
+            times: list[float] = []
+            first_stdout = ""
+            for i in range(RUNS):
+                elapsed, stdout, ok = run_once(final_host, remote_dir, run_cmd)
+                if not ok:
+                    logger.error("[%s] run %d failed", label, i + 1)
+                    continue
+                times.append(elapsed)
+                if i == 0:
+                    first_stdout = stdout
+                logger.info("  %s  run %d/%d: %.2fs", label, i + 1, RUNS, elapsed)
+
+            if not times:
+                logger.error("All runs failed for %s", label)
+                return 1
+
+            results[(variant, ds)] = {
+                "stats": _stats_row(times, RUNS),
+                "stdout": first_stdout,
+            }
+
+    # --- Phase 2: SSE validation ---
+    if has_intel:
+        intel_dir = PROJECT_DIR / "initial_code"
+        intel_remote = f"{REMOTE_DIR}-paper-sse-ref"
+
+        src_files = [p for p in intel_dir.iterdir() if p.is_file()]
+        logger.info("Uploading SSE reference to %s ...", jump_host)
+        if upload(jump_host, intel_remote, src_files) and compile_on_host(
+            jump_host, intel_remote, INTEL_COMPILE, "SSE ref"
+        ):
+            for ds in sorted(all_datasets):
+                if not upload_dataset(jump_host, intel_remote, DATASETS_DIR, ds):
+                    continue
+                run_cmd = f"./ssw_test demo/{ds} demo/{REFERENCE_FILE} 2>&1"
+                _, ref_stdout, ok = run_once(jump_host, intel_remote, run_cmd)
+                if not ok:
+                    logger.warning("SSE ref run failed for %s", ds)
+                    continue
+                logger.info("SSE reference for %s: OK", ds)
+
+                # Validate all variants that used this dataset
+                for (v, d), data in results.items():
+                    if d != ds:
+                        continue
+                    match, details = validate_output(ref_stdout, data["stdout"])
+                    data["correct"] = match
+                    status = "PASS" if match else "FAIL"
+                    logger.info("  Validation %s | %s: %s — %s", v, ds, status, details)
+
+    # --- Phase 3: Write CSV ---
+    write_csv(results, CSV_PATH, RUNS)
+
+    # --- Summary ---
+    print("\n" + "=" * 80)
+    print("PAPER BENCHMARK RESULTS")
+    print("=" * 80)
+    for (variant, ds), data in sorted(results.items()):
+        st = data["stats"]
+        correct = data.get("correct", "")
+        tag = " [OK]" if correct is True else " [MISMATCH]" if correct is False else ""
+        print(
+            f"  {variant:35s} {ds:10s}  "
+            f"mean={st['mean']:.2f}s  median={st['median']:.2f}s  "
+            f"stdev={st['stdev']:.2f}s  min={st['min']:.2f}s  max={st['max']:.2f}s"
+            f"{tag}"
+        )
+    print("=" * 80)
+    print(f"CSV written to: {CSV_PATH}")
+    return 0
 
 
 if __name__ == "__main__":

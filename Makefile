@@ -20,9 +20,8 @@ CHECK_DATASET ?= 10k.fa
 check:
 	uv run python -m src.check $(OUTPUT_DIR) --max-vlen $(MAX_VLEN) --dataset $(CHECK_DATASET)
 
-BENCHMARK_DATASET ?= 1M.fa
 benchmark:
-	uv run python -m src.benchmark --dataset $(BENCHMARK_DATASET)
+	uv run python -m src.benchmark
 
 WIDEN_SOURCE_DIR ?= translations/sequence-alignment
 WIDEN_OUTPUT_DIR ?= widened
