@@ -4,7 +4,6 @@ import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import numpy as np
 
 BENCHMARKS_CSV = Path(__file__).resolve().parent.parent / "benchmarks.csv"
@@ -357,43 +356,6 @@ def scaling_line_chart(rows):
 
 
 # ---------------------------------------------------------------------------
-# Graph 8: Coefficient of variation (stability comparison)
-# ---------------------------------------------------------------------------
-def stability_chart(rows):
-    variants = ["sequence-alignment", "sequence-alignment-widened",
-                "sequence-alignment-widened-auto"]
-    vdata = {v: get_variant_data(rows, v) for v in variants}
-    datasets = sorted(
-        set.intersection(*(set(vdata[v]) for v in variants)),
-        key=dataset_sort_key,
-    )
-
-    x = np.arange(len(datasets))
-    n = len(variants)
-    width = 0.25
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-
-    for i, v in enumerate(variants):
-        cvs = [vdata[v][ds]["stdev"] / vdata[v][ds]["mean"] * 100 for ds in datasets]
-        ax.bar(
-            x + i * width - width * (n - 1) / 2, cvs, width,
-            label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
-            edgecolor="white", linewidth=0.6,
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=12)
-    ax.set_ylabel("Coefficient of Variation (%)")
-    ax.set_xlabel("Dataset")
-    ax.legend()
-    ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.1f%%"))
-    ax.set_title("Run-time Stability (lower = more consistent)")
-    _strip_spines(ax)
-    fig.tight_layout()
-    save(fig, "stability_cv.png")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -408,7 +370,6 @@ def main():
     speedup_vs_naive(rows)
     speedup_widened_vs_sse(rows)
     scaling_line_chart(rows)
-    stability_chart(rows)
 
     print(f"\nDone \u2014 {len(list(GRAPHS_DIR.glob('*.png')))} graphs generated.")
 
