@@ -23,7 +23,7 @@ VARIANT_LABELS = {
     "sequence-alignment-widened-auto": "Widened (auto)",
 }
 
-DATASET_ORDER = ["1k.fa", "10k.fa", "100k.fa", "1M.fa"]
+DATASET_ORDER = ["1k.fa", "10k.fa", "100k.fa", "1M.fa", "10M.fa"]
 
 # --- Global style -----------------------------------------------------------
 BG_COLOR = "#FAFBFC"
