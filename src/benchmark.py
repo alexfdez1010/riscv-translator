@@ -52,9 +52,9 @@ VARIANTS: dict[str, str] = {
 # Deduplicated (variant, datasets) for all three comparison groups
 EXPERIMENT_PLAN: dict[str, list[str]] = {
     "naive": ["1k.fa", "10k.fa", "100k.fa"],
-    "sequence-alignment": ["1k.fa", "10k.fa", "100k.fa", "1M.fa"],
-    "sequence-alignment-widened": ["1k.fa","10k.fa", "100k.fa", "1M.fa"],
-    "sequence-alignment-widened-auto": ["1k.fa", "10k.fa", "100k.fa", "1M.fa"],
+    "sequence-alignment": ["1k.fa", "10k.fa", "100k.fa", "1M.fa", "10M.fa"],
+    "sequence-alignment-widened": ["1k.fa","10k.fa", "100k.fa", "1M.fa", "10M.fa"],
+    "sequence-alignment-widened-auto": ["1k.fa", "10k.fa", "100k.fa", "1M.fa", "10M.fa"],
 }
 
 RISCV_COMPILE = (
