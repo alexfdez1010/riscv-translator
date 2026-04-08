@@ -382,6 +382,77 @@ def scaling_line_chart(rows):
 
 
 # ---------------------------------------------------------------------------
+# GCUPS summary table
+# ---------------------------------------------------------------------------
+def print_gcups_table(rows):
+    print("\n" + "=" * 100)
+    print("GCUPS Summary Table")
+    print("=" * 100)
+    header = f"{'Variant':<32} {'Dataset':<10} {'Mean':>10} {'Median':>10} {'Min':>10} {'Max':>10} {'Stdev':>10}"
+    print(header)
+    print("-" * 100)
+
+    variants = list(VARIANT_LABELS.keys())
+    for v in variants:
+        vrows = sorted(
+            [r for r in rows if r["code_variant"] == v],
+            key=lambda r: dataset_sort_key(r["dataset"]),
+        )
+        for r in vrows:
+            ds = r["dataset"]
+            gcups_runs = [time_to_gcups(t, ds) for t in r["runs"]]
+            g_mean = np.mean(gcups_runs)
+            g_median = np.median(gcups_runs)
+            g_min = np.min(gcups_runs)
+            g_max = np.max(gcups_runs)
+            g_std = np.std(gcups_runs, ddof=1)
+            label = VARIANT_LABELS[v]
+            print(f"{label:<32} {ds:<10} {g_mean:>10.4f} {g_median:>10.4f} {g_min:>10.4f} {g_max:>10.4f} {g_std:>10.4f}")
+        print("-" * 100)
+
+
+# ---------------------------------------------------------------------------
+# Speedup summary tables
+# ---------------------------------------------------------------------------
+def print_speedup_tables(rows):
+    # --- Speedup vs Naive ---
+    naive = get_variant_data(rows, "naive")
+    sse = get_variant_data(rows, "sequence-alignment")
+    datasets = sorted(set(naive) & set(sse), key=dataset_sort_key)
+
+    print("\n" + "=" * 60)
+    print("Speedup: SSE→RVV over Naive (median times)")
+    print("=" * 60)
+    print(f"{'Dataset':<12} {'Naive (s)':>12} {'SSE→RVV (s)':>14} {'Speedup':>10}")
+    print("-" * 60)
+    for ds in datasets:
+        n_med = naive[ds]["median"]
+        s_med = sse[ds]["median"]
+        print(f"{ds:<12} {n_med:>12.4f} {s_med:>14.4f} {n_med / s_med:>10.4f}x")
+    print("-" * 60)
+
+    # --- Speedup widened vs SSE→RVV ---
+    widened_variants = ["sequence-alignment-widened", "sequence-alignment-widened-auto"]
+    vdata = {v: get_variant_data(rows, v) for v in widened_variants}
+    datasets = sorted(
+        set(sse) & set.intersection(*(set(vdata[v]) for v in widened_variants)),
+        key=dataset_sort_key,
+    )
+
+    print("\n" + "=" * 80)
+    print("Speedup: Widened variants over SSE→RVV (median times)")
+    print("=" * 80)
+    print(f"{'Dataset':<12} {'SSE→RVV (s)':>14} {'Widened(m) (s)':>16} {'Speedup':>10} {'Widened(a) (s)':>16} {'Speedup':>10}")
+    print("-" * 80)
+    for ds in datasets:
+        s_med = sse[ds]["median"]
+        wm_med = vdata["sequence-alignment-widened"][ds]["median"]
+        wa_med = vdata["sequence-alignment-widened-auto"][ds]["median"]
+        print(f"{ds:<12} {s_med:>14.4f} {wm_med:>16.4f} {s_med / wm_med:>10.4f}x {wa_med:>16.4f} {s_med / wa_med:>10.4f}x")
+    print("-" * 80)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -398,6 +469,8 @@ def main():
     scaling_line_chart(rows)
 
     print(f"\nDone \u2014 {len(list(GRAPHS_DIR.glob('*.png')))} graphs generated.")
+    print_gcups_table(rows)
+    print_speedup_tables(rows)
 
 
 if __name__ == "__main__":
