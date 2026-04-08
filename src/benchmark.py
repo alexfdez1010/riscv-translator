@@ -123,14 +123,27 @@ def compile_on_host(host: str, remote_dir: str, compile_cmd: str, label: str) ->
     return True
 
 
+def _parse_cpu_time(output: str) -> float | None:
+    """Extract 'CPU time: <seconds>' from program output."""
+    m = re.search(r'CPU time:\s*([\d.]+)\s*seconds', output)
+    return float(m.group(1)) if m else None
+
+
 def run_once(host: str, remote_dir: str, run_cmd: str) -> tuple[float, str, bool]:
-    """Run a command on host, return (elapsed, stdout, ok)."""
+    """Run a command on host, return (elapsed, stdout, ok).
+
+    Elapsed time is taken from the program's own 'CPU time:' output (which
+    measures only the alignment phase, excluding file I/O).  Falls back to
+    wall-clock time if the marker is not found.
+    """
     start = time.monotonic()
     r = subprocess.run(
         ["ssh", host, f"cd {remote_dir} && {run_cmd}"],
         capture_output=True, timeout=60 * 60 * 24, text=True,
     )
-    elapsed = time.monotonic() - start
+    wall = time.monotonic() - start
+    cpu = _parse_cpu_time(r.stdout)
+    elapsed = cpu if cpu is not None else wall
     return elapsed, r.stdout, r.returncode == 0
 
 
@@ -180,10 +193,9 @@ def run_locally(
     comp = subprocess.run(compile_cmd, shell=True, cwd=work_dir, capture_output=True, timeout=120, text=True)
     if comp.returncode != 0:
         return BenchmarkResult(host="localhost", label=label, ok=False, elapsed_seconds=0, stdout=comp.stdout, stderr=comp.stderr)
-    start = time.monotonic()
     run = subprocess.run(run_cmd, shell=True, cwd=work_dir, capture_output=True, timeout=600, text=True)
-    elapsed = time.monotonic() - start
-    return BenchmarkResult(host="localhost", label=label, ok=run.returncode == 0, elapsed_seconds=elapsed, stdout=run.stdout, stderr=run.stderr)
+    cpu = _parse_cpu_time(run.stderr) or _parse_cpu_time(run.stdout)
+    return BenchmarkResult(host="localhost", label=label, ok=run.returncode == 0, elapsed_seconds=cpu, stdout=run.stdout, stderr=run.stderr)
 
 
 def prepare_local_dir(original_dir: Path, dataset_dir: Path, dataset: str) -> Path:
