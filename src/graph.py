@@ -25,6 +25,25 @@ VARIANT_LABELS = {
 
 DATASET_ORDER = ["1k.fa", "10k.fa", "100k.fa", "1M.fa", "10M.fa"]
 
+# --- GCUPS computation ------------------------------------------------------
+# GCUPS = (m * n) / (t * 1e9)
+# m = total query residues = 100 queries * 54 residues each = 5400
+# n = number of residues in the dataset
+M_QUERY = 54 * 100  # 5400
+DATASET_RESIDUES = {
+    "1k.fa": 1001,
+    "10k.fa": 10001,
+    "100k.fa": 100001,
+    "1M.fa": 1000001,
+    "10M.fa": 10000001,
+}
+
+
+def time_to_gcups(t, dataset):
+    """Convert time in seconds to GCUPS for a given dataset."""
+    n = DATASET_RESIDUES[dataset]
+    return (M_QUERY * n) / (t * 1e9)
+
 # --- Global style -----------------------------------------------------------
 BG_COLOR = "#FAFBFC"
 GRID_COLOR = "#E0E4E8"
@@ -165,7 +184,7 @@ def boxplot_combined(rows):
         data, colors = [], []
         for v in variants:
             if ds in vdata[v]:
-                data.append(vdata[v][ds]["runs"])
+                data.append([time_to_gcups(t, ds) for t in vdata[v][ds]["runs"]])
                 colors.append(PALETTE[v])
 
         _styled_boxplot(ax, data, colors, width=0.55)
@@ -176,7 +195,7 @@ def boxplot_combined(rows):
             if ds in vdata[v]:
                 short_labels.append(VARIANT_LABELS[v])
         ax.set_xticklabels(short_labels, rotation=30, ha="right", fontsize=8.5)
-        ax.set_ylabel("Time (s)")
+        ax.set_ylabel("GCUPS")
         ax.set_title(ds, fontsize=13)
         _strip_spines(ax)
 
@@ -188,7 +207,7 @@ def boxplot_combined(rows):
                framealpha=0.95, edgecolor=GRID_COLOR,
                bbox_to_anchor=(0.5, -0.02))
 
-    fig.suptitle("Run-time Distribution \u2014 Translated Variants by Dataset",
+    fig.suptitle("GCUPS Distribution \u2014 Translated Variants by Dataset",
                  fontsize=15, fontweight="bold", y=1.01)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
     save(fig, "boxplot_combined.png")
@@ -212,27 +231,31 @@ def grouped_bar_translated(rows):
     fig, ax = plt.subplots(figsize=(10, 5.5))
 
     for i, v in enumerate(variants):
-        means = [vdata[v][ds]["mean"] for ds in datasets]
-        stdevs = [vdata[v][ds]["stdev"] for ds in datasets]
+        gcups_vals = [time_to_gcups(vdata[v][ds]["mean"], ds) for ds in datasets]
+        # Propagate stdev: GCUPS = k/t, so σ_GCUPS ≈ (k/t²)·σ_t = GCUPS·(σ_t/t)
+        gcups_errs = [
+            gcups_vals[j] * (vdata[v][ds]["stdev"] / vdata[v][ds]["mean"])
+            for j, ds in enumerate(datasets)
+        ]
         bars = ax.bar(
-            x + i * width - width * (n - 1) / 2, means, width,
-            yerr=stdevs, capsize=3,
+            x + i * width - width * (n - 1) / 2, gcups_vals, width,
+            yerr=gcups_errs, capsize=3,
             label=VARIANT_LABELS[v], color=PALETTE[v], alpha=0.85,
             error_kw=dict(lw=1, capthick=1, color="#7F8C8D"),
             edgecolor="white", linewidth=0.6,
         )
         # Value labels on bars
-        for bar, m in zip(bars, means):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    f"{m:.1f}s", ha="center", va="bottom", fontsize=8,
+        for bar, g in zip(bars, gcups_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
+                    f"{g:.4f}", ha="center", va="bottom", fontsize=8,
                     color=TEXT_COLOR, fontweight="medium")
 
     ax.set_xticks(x)
     ax.set_xticklabels(datasets, fontsize=12)
-    ax.set_ylabel("Mean Time (s)")
+    ax.set_ylabel("GCUPS")
     ax.set_xlabel("Dataset")
     ax.legend(loc="upper left")
-    ax.set_title("Translated Variants: Mean Execution Time")
+    ax.set_title("Translated Variants: GCUPS Performance")
     _strip_spines(ax)
     fig.tight_layout()
     save(fig, "bar_translated_variants.png")
@@ -330,10 +353,13 @@ def scaling_line_chart(rows):
 
     for v in variants:
         datasets = sorted(vdata[v].keys(), key=dataset_sort_key)
-        means = [vdata[v][ds]["mean"] for ds in datasets]
-        stdevs = [vdata[v][ds]["stdev"] for ds in datasets]
+        gcups_means = [time_to_gcups(vdata[v][ds]["mean"], ds) for ds in datasets]
+        gcups_errs = [
+            time_to_gcups(vdata[v][ds]["mean"], ds) * (vdata[v][ds]["stdev"] / vdata[v][ds]["mean"])
+            for ds in datasets
+        ]
         ax.errorbar(
-            datasets, means, yerr=stdevs, marker="o", capsize=4,
+            datasets, gcups_means, yerr=gcups_errs, marker="o", capsize=4,
             label=VARIANT_LABELS[v], color=PALETTE[v], linewidth=2.5,
             markersize=7, markeredgecolor="white", markeredgewidth=1.5,
             capthick=1, ecolor=PALETTE[v],
@@ -341,15 +367,15 @@ def scaling_line_chart(rows):
         # Fill between for confidence band
         ax.fill_between(
             datasets,
-            [m - s for m, s in zip(means, stdevs)],
-            [m + s for m, s in zip(means, stdevs)],
+            [m - s for m, s in zip(gcups_means, gcups_errs)],
+            [m + s for m, s in zip(gcups_means, gcups_errs)],
             color=PALETTE[v], alpha=0.08,
         )
 
-    ax.set_ylabel("Mean Time (s)")
+    ax.set_ylabel("GCUPS")
     ax.set_xlabel("Dataset")
     ax.legend(loc="upper left", framealpha=0.95)
-    ax.set_title("Execution Time Scaling Across Dataset Sizes")
+    ax.set_title("GCUPS Scaling Across Dataset Sizes")
     _strip_spines(ax)
     fig.tight_layout()
     save(fig, "scaling_line_chart.png")
