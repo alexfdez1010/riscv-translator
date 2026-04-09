@@ -41,7 +41,6 @@ from src.config import (
     RISCVCC,
     SIMULATOR,
     SSH_CC,
-    SSH_CXX,
     SSH_HOST,
     SSH_JUMP_HOST,
 )

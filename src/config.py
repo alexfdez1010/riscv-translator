@@ -20,7 +20,6 @@ SSH_HOST = os.getenv("SSH_HOST", "final")
 SSH_JUMP_HOST = os.getenv("SSH_JUMP_HOST", "")
 REMOTE_DIR = os.getenv("REMOTE_DIR", "/tmp/sse2rvv")
 SSH_CC = os.getenv("SSH_CC", "clang")
-SSH_CXX = os.getenv("SSH_CXX", "clang++")
 
 # ---------------------------------------------------------------------------
 # LLM (OpenRouter)
@@ -46,7 +45,6 @@ VALIDATION_TIMEOUT_SECONDS = int(os.getenv("VALIDATION_TIMEOUT_SECONDS", "120"))
 
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", "luispimo/riscv-toolchain:arm64-2025-10-20")
 RISCVCC = os.getenv("RISCVCC", "riscv64-unknown-elf-gcc")
-RISCVCXX = os.getenv("RISCVCXX", "riscv64-unknown-elf-g++")
 DATASETS_DIR = Path(os.getenv("DATASETS_DIR", str(PROJECT_DIR / "datasets")))
 VLEN = int(os.getenv("VLEN", "128"))
 SIMULATOR = os.getenv(
