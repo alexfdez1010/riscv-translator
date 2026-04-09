@@ -191,23 +191,17 @@ def test_infer_stage_runtime():
 
 
 # ---------------------------------------------------------------------------
-# Generate valid file tests
+# Apply LLM edits tests
 # ---------------------------------------------------------------------------
 
 
-def test_generate_valid_file_retries_with_feedback(monkeypatch, tmp_path):
+def test_apply_llm_edits_retries_on_format_failure(monkeypatch, tmp_path):
+    """When the first LLM response has no valid edits, _apply_llm_edits
+    retries with format feedback and succeeds on the second attempt."""
     responses = iter(
         [
-            "Add a required include before changing anything else.\n\n"
-            "<<<<<<< SEARCH\nseed\n=======\n#include <stdio.h>\nseed\n>>>>>>> REPLACE",
-            "Replace the placeholder line with a stub.\n\n"
+            "Here is my analysis but no edit blocks.",
             "<<<<<<< SEARCH\nseed\n=======\nvoid foo() {}\n>>>>>>> REPLACE",
-        ]
-    )
-    validations = iter(
-        [
-            ValidationResult(False, "compile", 1, "", "error: compile failed"),
-            ValidationResult(True, "validation", 0, "ok", ""),
         ]
     )
     calls = []
@@ -218,34 +212,21 @@ def test_generate_valid_file_retries_with_feedback(monkeypatch, tmp_path):
             self.llm = lambda messages: calls.append(messages) or next(responses)
 
     monkeypatch.setattr(repair, "LLM_VALIDATION_RETRIES", 2)
-    monkeypatch.setattr(
-        DockerValidator,
-        "validate",
-        lambda self, workspace_dir, build_command: next(validations),
-    )
-    monkeypatch.setattr(
-        repair,
-        "materialize_snapshot",
-        lambda workspace_dir, snapshot: None,
-    )
 
     agent = FakeAgent()
     snapshot = repair.SourceSnapshot(files={"lib.cpp": "seed\n", "lib.h": "h"})
-    workspaces = repair.WorkspaceSet(tmp_path, tmp_path)
 
-    result, validation = agent._generate_valid_file(
+    result = agent._apply_llm_edits(
         [{"role": "user", "content": "start"}],
         snapshot,
         "lib.cpp",
-        workspaces,
-        "make all",
     )
 
     assert result is not None
-    assert result.files["lib.cpp"] == "#include <stdio.h>\nvoid foo() {}\n"
-    assert validation.ok is True
+    assert result.files["lib.cpp"] == "void foo() {}\n"
     assert len(calls) == 2
-    assert "compile failed" in calls[1][-1].content
+    # Second call should include format feedback
+    assert "SEARCH" in calls[1][-1].content
 
 
 def test_run_writes_output_on_success(monkeypatch, tmp_path):
@@ -257,15 +238,23 @@ def test_run_writes_output_on_success(monkeypatch, tmp_path):
 
     _patch_infra(monkeypatch, tmp_path, docker_ok=False)
     monkeypatch.setattr(repair, "write_output", lambda d, s: d.mkdir(parents=True, exist_ok=True) or (d / "lib.cpp").write_text(s.files["lib.cpp"]))
+    monkeypatch.setattr(repair, "materialize_snapshot", lambda w, s: None)
 
+    validate_call = 0
+
+    def fake_validate_all(self, workspace_dir, build_command, ssh_compile, ssh_run):
+        nonlocal validate_call
+        validate_call += 1
+        if validate_call == 1:  # baseline
+            return ValidationResult(False, "compile", 1, "", "error: broken")
+        return ValidationResult(True, "all-passed", 0, "ok", "")
+
+    monkeypatch.setattr(repair.TranslationAgent, "_validate_all_stages", fake_validate_all)
     monkeypatch.setattr(
         repair.TranslationAgent,
-        "_generate_valid_file",
-        lambda self, messages, snapshot, file_name, workspaces, build_command: (
-            repair.SourceSnapshot(
-                files={**snapshot.files, "lib.cpp": "translated code"}
-            ),
-            ValidationResult(True, "validation", 0, "ok", ""),
+        "_apply_llm_edits",
+        lambda self, messages, snapshot, file_name: repair.SourceSnapshot(
+            files={**snapshot.files, "lib.cpp": "translated code"}
         ),
     )
 
@@ -321,14 +310,21 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
 
     _patch_infra(monkeypatch, tmp_path, docker_ok=False)
+    monkeypatch.setattr(repair, "materialize_snapshot", lambda w, s: None)
 
-    # _generate_valid_file always returns None (no progress)
+    # _apply_llm_edits returns edits but validation always fails
     monkeypatch.setattr(
         repair.TranslationAgent,
-        "_generate_valid_file",
-        lambda self, messages, snapshot, file_name, workspaces, build_command: (
-            None,
-            ValidationResult(False, "compile", 1, "", "still broken"),
+        "_apply_llm_edits",
+        lambda self, messages, snapshot, file_name: repair.SourceSnapshot(
+            files={**snapshot.files, "lib.cpp": "still broken"}
+        ),
+    )
+    monkeypatch.setattr(
+        repair.TranslationAgent,
+        "_validate_all_stages",
+        lambda self, workspace_dir, build_command, ssh_compile, ssh_run: ValidationResult(
+            False, "compile", 1, "", "still broken"
         ),
     )
 
@@ -345,7 +341,7 @@ def test_run_returns_1_after_max_steps(monkeypatch, tmp_path):
 
 
 def test_run_continues_after_edit_failure(monkeypatch, tmp_path):
-    """When _generate_valid_file returns None with edit-failure stage, run()
+    """When _apply_llm_edits returns None (no valid edits), run()
     should continue to the next step instead of stopping early."""
     source_dir = tmp_path / "src"
     source_dir.mkdir()
@@ -353,22 +349,27 @@ def test_run_continues_after_edit_failure(monkeypatch, tmp_path):
     output_dir = tmp_path / "out"
 
     _patch_infra(monkeypatch, tmp_path, docker_ok=False)
+    monkeypatch.setattr(repair, "materialize_snapshot", lambda w, s: None)
 
-    call_count = 0
+    edit_call_count = 0
+    validate_call_count = 0
 
-    def fake_generate(self, messages, snapshot, file_name, workspaces, build_command):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            # First step: edit-failure (no valid edits extracted)
-            return None, ValidationResult(False, "edit-failure", None, "", "No validation attempted.")
-        # Second step: succeed
-        return (
-            repair.SourceSnapshot(files={**snapshot.files, "lib.cpp": "fixed code"}),
-            ValidationResult(True, "validation", 0, "ok", ""),
-        )
+    def fake_apply_edits(self, messages, snapshot, file_name):
+        nonlocal edit_call_count
+        edit_call_count += 1
+        if edit_call_count == 1:
+            return None  # No valid edits
+        return repair.SourceSnapshot(files={**snapshot.files, "lib.cpp": "fixed code"})
 
-    monkeypatch.setattr(repair.TranslationAgent, "_generate_valid_file", fake_generate)
+    def fake_validate_all(self, workspace_dir, build_command, ssh_compile, ssh_run):
+        nonlocal validate_call_count
+        validate_call_count += 1
+        if validate_call_count == 1:  # baseline
+            return ValidationResult(False, "compile", 1, "", "error: broken")
+        return ValidationResult(True, "all-passed", 0, "ok", "")
+
+    monkeypatch.setattr(repair.TranslationAgent, "_apply_llm_edits", fake_apply_edits)
+    monkeypatch.setattr(repair.TranslationAgent, "_validate_all_stages", fake_validate_all)
     monkeypatch.setattr(repair, "write_output", lambda d, s: d.mkdir(parents=True, exist_ok=True) or (d / "lib.cpp").write_text(s.files["lib.cpp"]))
 
     rc = repair.TranslationAgent().run(
@@ -379,13 +380,13 @@ def test_run_continues_after_edit_failure(monkeypatch, tmp_path):
     )
 
     assert rc == 0
-    assert call_count >= 2, "Should have continued past the edit-failure step"
+    assert edit_call_count >= 2, "Should have continued past the edit-failure step"
     assert (output_dir / "lib.cpp").read_text() == "fixed code"
 
 
 def test_run_stops_early_on_internal_error(monkeypatch, tmp_path):
-    """When _generate_valid_file returns None with internal-error stage (e.g.
-    LLM API failure), run() should stop early and return 1."""
+    """When _apply_llm_edits raises an exception (e.g. LLM API failure),
+    run() should stop early and return 1."""
     source_dir = tmp_path / "src"
     source_dir.mkdir()
     (source_dir / "lib.cpp").write_text("broken\n")
@@ -393,12 +394,15 @@ def test_run_stops_early_on_internal_error(monkeypatch, tmp_path):
 
     _patch_infra(monkeypatch, tmp_path, docker_ok=False)
 
+    def fake_apply_edits(self, messages, snapshot, file_name):
+        raise RuntimeError("API key expired")
+
+    monkeypatch.setattr(repair.TranslationAgent, "_apply_llm_edits", fake_apply_edits)
     monkeypatch.setattr(
         repair.TranslationAgent,
-        "_generate_valid_file",
-        lambda self, messages, snapshot, file_name, workspaces, build_command: (
-            None,
-            ValidationResult(False, "internal-error", None, "", "API key expired"),
+        "_validate_all_stages",
+        lambda self, workspace_dir, build_command, ssh_compile, ssh_run: ValidationResult(
+            False, "compile", 1, "", "error: broken"
         ),
     )
 

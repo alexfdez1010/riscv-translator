@@ -2,15 +2,22 @@
 
 Ports C/C++ source files that use x86 SSE intrinsics to RISC-V by swapping
 SSE headers with the sse2rvv.h drop-in compatibility header and fixing any
-remaining compiler errors via an LLM compile-fix loop:
+remaining compiler errors via a ReAct agent loop:
 
   1. Start with SSE source code in a workspace.
   2. Pre-process: replace SSE headers with ``#include "sse2rvv.h"``.
-  3. LLM proposes minimal diffs to fix remaining compilation issues.
-  4. Validate by compiling + running in Docker/QEMU (simulator).
-  5. If errors, feed compiler output back to the LLM and loop.
-  6. Once the simulator passes, validate on real hardware via SSH.
-  7. Loop until fully passing or max steps exhausted.
+  3. ReAct loop — each iteration:
+     a. **Reason**: LLM analyses feedback from the previous iteration
+        and proposes a minimal search-and-replace patch.
+     b. **Act**: The patch is applied and the code is run through a
+        two-stage validation chain:
+        - Stage 1 — Simulator validation: cross-compile + Spike execution.
+        - Stage 2 — Hardware validation: native compile + run on real
+          RISC-V hardware + output comparison against Intel SSE reference.
+        The chain stops at the first failure; diagnostics feed the next
+        Reason step.
+  4. The loop terminates when both stages pass in a single iteration,
+     or after a hard limit of iterations.
 
 On success the entire workspace (all source files) is written to the
 output directory so the result is self-contained and ready to compile.
@@ -373,46 +380,87 @@ class TranslationAgent:
             ),
         )
 
-    def _generate_valid_file(
+    def _validate_all_stages(
+        self,
+        workspace_dir: Path,
+        build_command: str,
+        ssh_compile_command: str | None,
+        ssh_run_command: str | None,
+    ) -> ValidationResult:
+        """Run the two-stage validation chain: simulator → hardware + correctness.
+
+        Stages execute strictly in order; the chain stops at the first failure
+        and returns its diagnostic output.
+        """
+        # Stage 1: Simulator validation (Docker/QEMU + Spike)
+        result = self.docker_validator.validate(workspace_dir, build_command)
+        logger.info(
+            "Simulator validation: ok=%s stage=%s rc=%s\n%s",
+            result.ok, result.stage, result.returncode,
+            truncate_for_log(result.combined_output, 2000),
+        )
+        if not result.ok:
+            return result
+
+        # Stage 2: Hardware validation (SSH compile + run + correctness check)
+        if not (ssh_compile_command and ssh_run_command):
+            return result
+
+        ssh_files = [p for p in workspace_dir.iterdir()]
+        ssh_result = self.ssh_validator.validate(
+            ssh_files, ssh_compile_command, ssh_run_command
+        )
+        if not ssh_result.ok:
+            logger.warning(
+                "Passed simulator but failed hardware at stage %s\n%s",
+                ssh_result.stage, ssh_result.combined_output,
+            )
+            return ValidationResult(
+                ok=False,
+                stage=ssh_result.stage,
+                returncode=ssh_result.returncode,
+                stdout=ssh_result.stdout,
+                stderr=(
+                    "Passed QEMU emulation but FAILED on real RISC-V hardware.\n"
+                    f"{ssh_result.combined_output}"
+                ),
+            )
+
+        # Correctness check against Intel reference
+        correctness = self._validate_correctness(workspace_dir)
+        if correctness is not None and not correctness.ok:
+            return correctness
+
+        logger.info("All validation stages passed")
+        return ValidationResult(
+            ok=True,
+            stage="all-passed",
+            returncode=0,
+            stdout=ssh_result.stdout,
+            stderr="",
+        )
+
+    def _apply_llm_edits(
         self,
         messages: list[dict[str, str]],
         snapshot: SourceSnapshot,
         file_name: str,
-        workspaces: WorkspaceSet,
-        build_command: str,
-    ) -> tuple[SourceSnapshot | None, ValidationResult]:
-        """Run one LLM request cycle with retries on diff/validation failure."""
+    ) -> SourceSnapshot | None:
+        """Call LLM and apply search/replace edits.
+
+        Retries up to LLM_VALIDATION_RETRIES times on edit format failures.
+        Returns the updated snapshot, or None if no valid edits could be
+        extracted.  Raises on unrecoverable LLM errors.
+        """
         active_messages = list(messages)
-        current_snapshot = snapshot
-        latest_validation = ValidationResult(
-            ok=False,
-            stage="edit-failure",
-            returncode=None,
-            stdout="",
-            stderr="No validation attempted.",
-        )
 
         for attempt in range(LLM_VALIDATION_RETRIES + 1):
-            # --- LLM request ---
-            try:
-                logger.info(
-                    "LLM request attempt %d with %d message(s)",
-                    attempt + 1,
-                    len(active_messages),
-                )
-                response = self.llm(_to_messages(active_messages))
-            except Exception as exc:
-                latest_validation = ValidationResult(
-                    ok=False,
-                    stage="internal-error",
-                    returncode=None,
-                    stdout="",
-                    stderr=str(exc),
-                )
-                logger.warning(
-                    "LLM generation failed on attempt %d: %s", attempt + 1, exc
-                )
-                return None, latest_validation
+            logger.info(
+                "LLM request attempt %d with %d message(s)",
+                attempt + 1,
+                len(active_messages),
+            )
+            response = self.llm(_to_messages(active_messages))
 
             logger.info(
                 "LLM response (attempt %d, %d chars):\n%s",
@@ -422,9 +470,7 @@ class TranslationAgent:
             )
 
             # --- Extract and apply search/replace blocks ---
-            candidate_snapshot = None
             edit_error = None
-
             sr_blocks = extract_search_replace(response)
             if sr_blocks is not None:
                 logger.info(
@@ -433,10 +479,10 @@ class TranslationAgent:
                 )
                 try:
                     new_content = apply_search_replace(
-                        current_snapshot.files[file_name], sr_blocks,
+                        snapshot.files[file_name], sr_blocks,
                     )
-                    candidate_snapshot = apply_content_to_snapshot(
-                        current_snapshot, file_name, new_content,
+                    return apply_content_to_snapshot(
+                        snapshot, file_name, new_content,
                     )
                 except ValueError as exc:
                     logger.warning(
@@ -445,74 +491,30 @@ class TranslationAgent:
                     )
                     edit_error = str(exc)
 
-            if candidate_snapshot is None:
-                error_msg = edit_error or (
-                    "Could not extract edits from the response. "
-                    "Use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks."
-                )
-                logger.warning(
-                    "No valid edits on attempt %d: %s", attempt + 1, error_msg,
-                )
-                if attempt >= LLM_VALIDATION_RETRIES:
-                    return None, latest_validation
-                active_messages = active_messages + [
-                    {"role": "assistant", "content": response},
-                    {
-                        "role": "user",
-                        "content": build_edit_format_feedback(
-                            file_name,
-                            current_snapshot.files[file_name],
-                            error_msg,
-                        ),
-                    },
-                ]
-                continue
-
-            # --- Validate in Docker/QEMU ---
-            materialize_snapshot(workspaces.workspace_dir, candidate_snapshot)
-            latest_validation = self.docker_validator.validate(
-                workspaces.workspace_dir,
-                build_command,
+            error_msg = edit_error or (
+                "Could not extract edits from the response. "
+                "Use <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks."
             )
-            logger.info(
-                "Validation result (attempt %d): ok=%s stage=%s rc=%s\n%s",
-                attempt + 1,
-                latest_validation.ok,
-                latest_validation.stage,
-                latest_validation.returncode,
-                truncate_for_log(latest_validation.combined_output, 2000),
+            logger.warning(
+                "No valid edits on attempt %d: %s", attempt + 1, error_msg,
             )
-
-            if latest_validation.ok:
-                if attempt > 0:
-                    logger.info(
-                        "Candidate fixed after %d retry(s)", attempt
-                    )
-                return candidate_snapshot, latest_validation
 
             if attempt >= LLM_VALIDATION_RETRIES:
-                logger.warning(
-                    "Validation failed after %d attempt(s); "
-                    "returning latest snapshot for next step",
-                    attempt + 1,
-                )
-                return candidate_snapshot, latest_validation
+                return None
 
-            # Feed errors back for retry
             active_messages = active_messages + [
                 {"role": "assistant", "content": response},
                 {
                     "role": "user",
-                    "content": build_repair_prompt(
+                    "content": build_edit_format_feedback(
                         file_name,
-                        candidate_snapshot.files[file_name],
-                        latest_validation.as_feedback(),
+                        snapshot.files[file_name],
+                        error_msg,
                     ),
                 },
             ]
-            current_snapshot = candidate_snapshot
 
-        return None, latest_validation
+        return None
 
     def run(
         self,
@@ -559,7 +561,7 @@ class TranslationAgent:
             files={name: (source_dir / name).read_text() for name in file_names}
         )
 
-        # --- Pre-processing: replace SSE headers with Highway includes ---
+        # --- Pre-processing: replace SSE headers with sse2rvv.h ---
         snapshot = preprocess_snapshot(snapshot)
 
         workspaces = create_workspace(source_dir, snapshot, test_data_dir)
@@ -569,69 +571,24 @@ class TranslationAgent:
 
         try:
             # --- Baseline validation ---
-            baseline = self.docker_validator.validate(
-                workspaces.workspace_dir, build_command
+            latest_validation = self._validate_all_stages(
+                workspaces.workspace_dir, build_command,
+                ssh_compile_command, ssh_run_command,
             )
-            logger.info(
-                "Baseline validation: ok=%s stage=%s rc=%s\n%s",
-                baseline.ok,
-                baseline.stage,
-                baseline.returncode,
-                truncate_for_log(baseline.combined_output, 3000),
-            )
+            if latest_validation.ok:
+                logger.info("Input already passes all validations")
+                write_output(output_dir, snapshot)
+                return 0
 
-            if baseline.ok:
-                # Already compiles + runs; try SSH hardware
-                if ssh_compile_command and ssh_run_command:
-                    ssh_files = [
-                        p for p in workspaces.workspace_dir.iterdir()
-                    ]
-                    ssh_result = self.ssh_validator.validate(
-                        ssh_files, ssh_compile_command, ssh_run_command
-                    )
-                    if ssh_result.ok:
-                        # Correctness check against Intel reference
-                        correctness = self._validate_correctness(workspaces.workspace_dir)
-                        if correctness is None or correctness.ok:
-                            logger.info("Input already passes all validations")
-                            write_output(output_dir, snapshot)
-                            return 0
-                        logger.warning(
-                            "Baseline passes SSH but fails correctness check; "
-                            "proceeding with repair\n%s",
-                            correctness.combined_output,
-                        )
-                        baseline = correctness
-                    else:
-                        logger.warning(
-                            "Baseline passes QEMU but fails SSH at stage %s; "
-                            "proceeding with repair\n%s",
-                            ssh_result.stage,
-                            ssh_result.combined_output,
-                        )
-                        baseline = ValidationResult(
-                            ok=False,
-                            stage=ssh_result.stage,
-                            returncode=ssh_result.returncode,
-                            stdout=ssh_result.stdout,
-                            stderr=(
-                                "Passed QEMU emulation but FAILED on real RISC-V hardware.\n"
-                                f"{ssh_result.combined_output}"
-                            ),
-                        )
-                else:
-                    logger.info("Input already passes Docker/QEMU validation")
-                    write_output(output_dir, snapshot)
-                    return 0
-
-            # --- Main repair loop ---
+            # --- ReAct loop ---
             current_snapshot = snapshot
-            latest_validation = baseline
 
             for step in range(1, max_steps + 1):
                 logger.info(
-                    "Translation step %d/%d for %s", step, max_steps, target_file
+                    "ReAct step %d/%d for %s", step, max_steps, target_file
                 )
+
+                # -- Reason: LLM analyses feedback and proposes a patch --
                 current_code = current_snapshot.files[target_file]
 
                 if step == 1:
@@ -653,86 +610,44 @@ class TranslationAgent:
                     {"role": "user", "content": user_content},
                 ]
 
-                repaired_snapshot, latest_validation = self._generate_valid_file(
-                    messages,
-                    current_snapshot,
-                    target_file,
-                    workspaces,
-                    build_command,
-                )
+                try:
+                    candidate = self._apply_llm_edits(
+                        messages, current_snapshot, target_file,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Stopping early due to unrecoverable error: %s", exc
+                    )
+                    return 1
 
-                if repaired_snapshot is None:
-                    if latest_validation.stage == "internal-error":
-                        logger.warning(
-                            "Stopping early due to unrecoverable error: %s",
-                            latest_validation.stderr,
-                        )
-                        return 1
+                if candidate is None:
                     logger.info(
-                        "Step %d did not yield a valid candidate (%s), continuing",
-                        step, latest_validation.stage,
+                        "Step %d did not yield valid edits, continuing", step
                     )
                     continue
 
-                if latest_validation.ok:
-                    current_snapshot = repaired_snapshot
+                current_snapshot = candidate
 
-                    # Try SSH hardware validation
-                    if ssh_compile_command and ssh_run_command:
-                        ssh_files = [
-                            p for p in workspaces.workspace_dir.iterdir()
-                        ]
-                        ssh_result = self.ssh_validator.validate(
-                            ssh_files, ssh_compile_command, ssh_run_command
-                        )
-                        if ssh_result.ok:
-                            # Correctness check against Intel reference
-                            correctness = self._validate_correctness(workspaces.workspace_dir)
-                            if correctness is None or correctness.ok:
-                                write_output(output_dir, current_snapshot)
-                                logger.info(
-                                    "Translation succeeded; wrote output to %s",
-                                    output_dir,
-                                )
-                                return 0
-                            logger.warning(
-                                "Step %d passed SSH but failed correctness check\n%s",
-                                step,
-                                correctness.combined_output,
-                            )
-                            latest_validation = correctness
-                        else:
-                            logger.warning(
-                                "Step %d passed QEMU but failed SSH at stage %s\n%s",
-                                step,
-                                ssh_result.stage,
-                                ssh_result.combined_output,
-                            )
-                            latest_validation = ValidationResult(
-                                ok=False,
-                                stage=ssh_result.stage,
-                                returncode=ssh_result.returncode,
-                                stdout=ssh_result.stdout,
-                                stderr=(
-                                    "Passed QEMU emulation but FAILED on real hardware.\n"
-                                    f"{ssh_result.combined_output}"
-                                ),
-                            )
-                    else:
-                        # No SSH configured — QEMU pass is success
-                        write_output(output_dir, current_snapshot)
-                        logger.info(
-                            "Translation succeeded (QEMU only); wrote output to %s",
-                            output_dir,
-                        )
-                        return 0
+                # -- Act: apply patch and run two-stage validation chain --
+                materialize_snapshot(workspaces.workspace_dir, current_snapshot)
 
-                # Keep partial progress for next step
-                logger.info(
-                    "Step %d made progress but validation still fails; continuing",
-                    step,
+                latest_validation = self._validate_all_stages(
+                    workspaces.workspace_dir, build_command,
+                    ssh_compile_command, ssh_run_command,
                 )
-                current_snapshot = repaired_snapshot
+
+                if latest_validation.ok:
+                    write_output(output_dir, current_snapshot)
+                    logger.info(
+                        "Translation succeeded at step %d; wrote output to %s",
+                        step, output_dir,
+                    )
+                    return 0
+
+                logger.info(
+                    "Step %d: validation failed at stage %s; feeding back to LLM",
+                    step, latest_validation.stage,
+                )
 
             logger.warning("Translation failed after %d step(s)", max_steps)
             write_output(output_dir, current_snapshot)
