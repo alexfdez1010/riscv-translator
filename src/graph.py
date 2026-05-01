@@ -66,15 +66,15 @@ def _apply_style():
         "grid.linewidth": 0.6,
         "grid.alpha": 0.8,
         "axes.labelcolor": TEXT_COLOR,
-        "axes.labelsize": 12,
+        "axes.labelsize": 16,
         "axes.labelweight": "medium",
-        "axes.titlesize": 14,
+        "axes.titlesize": 18,
         "axes.titleweight": "bold",
         "axes.titlepad": 14,
         "xtick.color": TEXT_COLOR,
         "ytick.color": TEXT_COLOR,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
         "xtick.major.pad": 6,
         "ytick.major.pad": 6,
         "xtick.major.size": 0,
@@ -82,11 +82,11 @@ def _apply_style():
         "legend.frameon": True,
         "legend.framealpha": 0.9,
         "legend.edgecolor": GRID_COLOR,
-        "legend.fontsize": 10,
+        "legend.fontsize": 13,
         "legend.borderpad": 0.8,
         "legend.handlelength": 1.5,
         "font.family": FONT_FAMILY,
-        "font.size": 11,
+        "font.size": 14,
         "text.color": TEXT_COLOR,
         "figure.dpi": DPI,
         "savefig.dpi": DPI,
@@ -175,7 +175,7 @@ def boxplot_combined(rows):
         key=dataset_sort_key,
     )
 
-    fig, axes = plt.subplots(1, len(datasets), figsize=(4.2 * len(datasets), 6),
+    fig, axes = plt.subplots(1, len(datasets), figsize=(4.8 * len(datasets), 7),
                              sharey=False)
     if len(datasets) == 1:
         axes = [axes]
@@ -194,21 +194,22 @@ def boxplot_combined(rows):
         for v in variants:
             if ds in vdata[v]:
                 short_labels.append(VARIANT_LABELS[v])
-        ax.set_xticklabels(short_labels, rotation=30, ha="right", fontsize=8.5)
+        ax.set_xticklabels(short_labels, rotation=30, ha="right", fontsize=15)
+        ax.tick_params(axis="y", labelsize=15)
         ax.set_ylabel("GCUPS")
-        ax.set_title(ds, fontsize=13)
+        ax.set_title(ds, fontsize=17)
         _strip_spines(ax)
 
     # Shared legend outside the subplots (centered below)
     legend_handles = [Patch(facecolor=PALETTE[v], alpha=0.75, label=VARIANT_LABELS[v])
                       for v in variants]
     fig.legend(handles=legend_handles, loc="lower center",
-               ncol=len(variants), fontsize=10, frameon=True,
+               ncol=len(variants), fontsize=16, frameon=True,
                framealpha=0.95, edgecolor=GRID_COLOR,
                bbox_to_anchor=(0.5, -0.02))
 
     fig.suptitle("GCUPS Distribution \u2014 Translated Variants by Dataset",
-                 fontsize=15, fontweight="bold", y=1.01)
+                 fontsize=19, fontweight="bold", y=1.01)
     fig.tight_layout(rect=[0, 0.05, 1, 1])
     save(fig, "boxplot_combined.png")
 
@@ -246,15 +247,15 @@ def grouped_bar_translated(rows):
         )
         # Value labels on bars
         for bar, g in zip(bars, gcups_vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
-                    f"{g:.4f}", ha="center", va="bottom", fontsize=8,
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                    f"{g:.4f}", ha="center", va="bottom", fontsize=8.5,
                     color=TEXT_COLOR, fontweight="medium")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=12)
+    ax.set_xticklabels(datasets, fontsize=14)
     ax.set_ylabel("GCUPS")
     ax.set_xlabel("Dataset")
-    ax.legend(loc="upper left")
+    ax.legend(loc="lower right")
     ax.set_title("Translated Variants: GCUPS Performance")
     _strip_spines(ax)
     fig.tight_layout()
@@ -284,10 +285,10 @@ def speedup_vs_naive(rows):
         ax.text(bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + 0.2,
                 f"{sp:.1f}x", ha="center", va="bottom",
-                fontsize=10, fontweight="bold", color=TEXT_COLOR)
+                fontsize=13, fontweight="bold", color=TEXT_COLOR)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=12)
+    ax.set_xticklabels(datasets, fontsize=14)
     ax.set_ylabel("Speedup (x)")
     ax.set_xlabel("Dataset")
     ax.axhline(y=1, color=PALETTE["naive"], linestyle="--", linewidth=1, alpha=0.5,
@@ -330,7 +331,7 @@ def speedup_widened_vs_sse(rows):
                     fontsize=10, fontweight="bold", color=TEXT_COLOR)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(datasets, fontsize=12)
+    ax.set_xticklabels(datasets, fontsize=14)
     ax.set_ylabel("Speedup (x)")
     ax.set_xlabel("Dataset")
     ax.axhline(y=1, color=PALETTE["sequence-alignment"], linestyle="--",
@@ -374,7 +375,7 @@ def scaling_line_chart(rows):
 
     ax.set_ylabel("GCUPS")
     ax.set_xlabel("Dataset")
-    ax.legend(loc="upper left", framealpha=0.95)
+    ax.legend(loc="lower right", framealpha=0.95)
     ax.set_title("GCUPS Scaling Across Dataset Sizes")
     _strip_spines(ax)
     fig.tight_layout()
