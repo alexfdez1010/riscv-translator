@@ -4,7 +4,7 @@
 > **"Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven
 > Translation"** (Fernández Camello, Prieto-Matias & Garcia Sanchez),
 > published at the **XXXVI Jornadas SARTECO 2026**.
-> [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21064372.svg)](https://doi.org/10.5281/zenodo.21064372)
+> [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21064372-blue)](https://doi.org/10.5281/zenodo.21064372)
 > See [Citation](#citation) for how to cite this work.
 
 Automated pipeline that translates C/C++ code using x86 SSE/SSE2 SIMD intrinsics to RISC-V Vector (RVV) extensions. An LLM reads compiler errors and produces source patches in a loop until the code compiles and runs on RISC-V — no manual porting needed.
@@ -221,7 +221,7 @@ software or its results, please cite it.
 > Translation*. XXXVI Jornadas SARTECO 2026.
 > https://doi.org/10.5281/zenodo.21064372
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21064372.svg)](https://doi.org/10.5281/zenodo.21064372)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21064372-blue)](https://doi.org/10.5281/zenodo.21064372)
 
 A machine-readable [`CITATION.cff`](CITATION.cff) is also provided. BibTeX:
 
