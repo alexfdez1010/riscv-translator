@@ -204,6 +204,31 @@ graphs/                     Generated benchmark plots
 benchmarks.csv              Benchmark results
 ```
 
+## Citation
+
+This work was published at the **XXXVI Jornadas SARTECO 2026**. If you use this
+software or its results, please cite it.
+
+> Fernández Camello, A., Prieto-Matias, M., & Garcia Sanchez, C. (2026).
+> *Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven
+> Translation*. XXXVI Jornadas SARTECO 2026.
+> https://doi.org/10.5281/zenodo.21064372
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21064372.svg)](https://doi.org/10.5281/zenodo.21064372)
+
+A machine-readable [`CITATION.cff`](CITATION.cff) is also provided. BibTeX:
+
+```bibtex
+@inproceedings{fernandezcamello2026ssw,
+  title     = {Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven Translation},
+  author    = {Fern\'andez Camello, Alejandro and Prieto-Matias, Manuel and Garcia Sanchez, Carlos},
+  booktitle = {XXXVI Jornadas SARTECO 2026},
+  year      = {2026},
+  doi       = {10.5281/zenodo.21064372},
+  url       = {https://doi.org/10.5281/zenodo.21064372}
+}
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

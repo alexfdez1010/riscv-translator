@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven Translation"
+authors:
+  - family-names: "Fernández Camello"
+    given-names: "Alejandro"
+    affiliation: "Universidad Complutense de Madrid"
+  - family-names: "Prieto-Matias"
+    given-names: "Manuel"
+    affiliation: "Universidad Complutense de Madrid"
+  - family-names: "Garcia Sanchez"
+    given-names: "Carlos"
+    affiliation: "Universidad Complutense de Madrid"
+date-released: 2026-06-19
+doi: "10.5281/zenodo.21064372"
+url: "https://github.com/alexfdez1010/riscv-translator"
+license: "MIT"
+repository-code: "https://github.com/alexfdez1010/riscv-translator"
+type: software
+preferred-citation:
+  type: conference-paper
+  title: "Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven Translation"
+  authors:
+    - family-names: "Fernández Camello"
+      given-names: "Alejandro"
+      affiliation: "Universidad Complutense de Madrid"
+    - family-names: "Prieto-Matias"
+      given-names: "Manuel"
+      affiliation: "Universidad Complutense de Madrid"
+    - family-names: "Garcia Sanchez"
+      given-names: "Carlos"
+      affiliation: "Universidad Complutense de Madrid"
+  collection-title: "XXXVI Jornadas SARTECO 2026"
+  year: 2026
+  doi: "10.5281/zenodo.21064372"
