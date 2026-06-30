@@ -1,5 +1,12 @@
 # RISC-V Translator
 
+> 📄 This repository contains the source code accompanying the paper
+> **"Porting the Striped Smith-Waterman Library to RISC-V via LLM-Driven
+> Translation"** (Fernández Camello, Prieto-Matias & Garcia Sanchez),
+> published at the **XXXVI Jornadas SARTECO 2026**.
+> [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21064372.svg)](https://doi.org/10.5281/zenodo.21064372)
+> See [Citation](#citation) for how to cite this work.
+
 Automated pipeline that translates C/C++ code using x86 SSE/SSE2 SIMD intrinsics to RISC-V Vector (RVV) extensions. An LLM reads compiler errors and produces source patches in a loop until the code compiles and runs on RISC-V — no manual porting needed.
 
 Uses **[sse2rvv](https://github.com/pattonkan/sse2rvv)** (a header-only SSE-to-RVV compatibility layer) and the **[SSW library](https://github.com/mengyao/Complete-Striped-Smith-Waterman-Library)** as its test case.
